@@ -1,0 +1,2676 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="646" onload="init(evt)" viewBox="0 0 1200 646" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="646.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="629" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="629" > </text>
+<g id="frames">
+<g >
+<title>internal/poll.(*FD).Read.func1 (1,302 samples, 0.96%)</title><rect x="1167.7" y="453" width="11.3" height="15.0" fill="rgb(245,58,22)" rx="2" ry="2" />
+<text  x="1170.71" y="463.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/zedagent.Run (43 samples, 0.03%)</title><rect x="1186.8" y="533" width="0.3" height="15.0" fill="rgb(236,5,38)" rx="2" ry="2" />
+<text  x="1189.75" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (17 samples, 0.01%)</title><rect x="1184.1" y="229" width="0.1" height="15.0" fill="rgb(243,38,21)" rx="2" ry="2" />
+<text  x="1187.07" y="239.5" ></text>
+</g>
+<g >
+<title>os.(*File).Write (27 samples, 0.02%)</title><rect x="1184.0" y="501" width="0.2" height="15.0" fill="rgb(234,69,17)" rx="2" ry="2" />
+<text  x="1186.99" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (20 samples, 0.01%)</title><rect x="22.8" y="421" width="0.2" height="15.0" fill="rgb(254,6,32)" rx="2" ry="2" />
+<text  x="25.82" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (17 samples, 0.01%)</title><rect x="22.8" y="357" width="0.2" height="15.0" fill="rgb(208,48,10)" rx="2" ry="2" />
+<text  x="25.84" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="14.2" y="357" width="0.1" height="15.0" fill="rgb(238,145,41)" rx="2" ry="2" />
+<text  x="17.16" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (704 samples, 0.52%)</title><rect x="25.8" y="517" width="6.1" height="15.0" fill="rgb(221,178,35)" rx="2" ry="2" />
+<text  x="28.76" y="527.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/zedrouter.getNetworkMetrics (12 samples, 0.01%)</title><rect x="1187.2" y="501" width="0.1" height="15.0" fill="rgb(229,44,31)" rx="2" ry="2" />
+<text  x="1190.24" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (168 samples, 0.12%)</title><rect x="1164.0" y="309" width="1.5" height="15.0" fill="rgb(205,19,16)" rx="2" ry="2" />
+<text  x="1166.99" y="319.5" ></text>
+</g>
+<g >
+<title>syscall.Syscall (12 samples, 0.01%)</title><rect x="16.6" y="277" width="0.1" height="15.0" fill="rgb(227,8,16)" rx="2" ry="2" />
+<text  x="19.62" y="287.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="23.0" y="501" width="0.1" height="15.0" fill="rgb(252,162,25)" rx="2" ry="2" />
+<text  x="26.01" y="511.5" ></text>
+</g>
+<g >
+<title>runtime.scanobject (38 samples, 0.03%)</title><rect x="11.7" y="485" width="0.3" height="15.0" fill="rgb(212,197,17)" rx="2" ry="2" />
+<text  x="14.70" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (138 samples, 0.10%)</title><rect x="1164.3" y="293" width="1.2" height="15.0" fill="rgb(254,1,14)" rx="2" ry="2" />
+<text  x="1167.25" y="303.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/diff/walking/plugin.(*diffPlugin).Apply (431 samples, 0.32%)</title><rect x="14.3" y="421" width="3.8" height="15.0" fill="rgb(210,129,30)" rx="2" ry="2" />
+<text  x="17.32" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (82 samples, 0.06%)</title><rect x="10.1" y="549" width="0.7" height="15.0" fill="rgb(251,210,38)" rx="2" ry="2" />
+<text  x="13.05" y="559.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/zedrouter.publishNetworkInstanceMetricsAll (12 samples, 0.01%)</title><rect x="1187.2" y="517" width="0.1" height="15.0" fill="rgb(209,200,40)" rx="2" ry="2" />
+<text  x="1190.24" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (140 samples, 0.10%)</title><rect x="1179.8" y="341" width="1.2" height="15.0" fill="rgb(236,149,51)" rx="2" ry="2" />
+<text  x="1182.77" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="1165.7" y="389" width="0.2" height="15.0" fill="rgb(225,91,35)" rx="2" ry="2" />
+<text  x="1168.73" y="399.5" ></text>
+</g>
+<g >
+<title>[unknown] (887 samples, 0.65%)</title><rect x="34.7" y="549" width="7.7" height="15.0" fill="rgb(249,195,20)" rx="2" ry="2" />
+<text  x="37.73" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="14.2" y="341" width="0.1" height="15.0" fill="rgb(223,133,10)" rx="2" ry="2" />
+<text  x="17.16" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (876 samples, 0.65%)</title><rect x="34.8" y="517" width="7.6" height="15.0" fill="rgb(244,119,34)" rx="2" ry="2" />
+<text  x="37.82" y="527.5" ></text>
+</g>
+<g >
+<title>jbd2/sda9-8 (92 samples, 0.07%)</title><rect x="19.8" y="581" width="0.8" height="15.0" fill="rgb(252,221,19)" rx="2" ry="2" />
+<text  x="22.76" y="591.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="22.9" y="341" width="0.1" height="15.0" fill="rgb(239,152,46)" rx="2" ry="2" />
+<text  x="25.85" y="351.5" ></text>
+</g>
+<g >
+<title>archive/tar.(*Reader).Read (208 samples, 0.15%)</title><rect x="14.4" y="309" width="1.8" height="15.0" fill="rgb(254,9,35)" rx="2" ry="2" />
+<text  x="17.41" y="319.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="23.0" y="485" width="0.1" height="15.0" fill="rgb(247,92,35)" rx="2" ry="2" />
+<text  x="26.01" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (23 samples, 0.02%)</title><rect x="11.1" y="437" width="0.2" height="15.0" fill="rgb(237,152,53)" rx="2" ry="2" />
+<text  x="14.07" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="1165.3" y="165" width="0.2" height="15.0" fill="rgb(213,43,26)" rx="2" ry="2" />
+<text  x="1168.32" y="175.5" ></text>
+</g>
+<g >
+<title>[qemu-system-x86_64] (97 samples, 0.07%)</title><rect x="32.3" y="549" width="0.9" height="15.0" fill="rgb(253,163,27)" rx="2" ry="2" />
+<text  x="35.32" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (87 samples, 0.06%)</title><rect x="19.8" y="533" width="0.8" height="15.0" fill="rgb(229,82,1)" rx="2" ry="2" />
+<text  x="22.81" y="543.5" ></text>
+</g>
+<g >
+<title>runtime.exitsyscallfast.func1 (13 samples, 0.01%)</title><rect x="12.1" y="469" width="0.1" height="15.0" fill="rgb(219,162,1)" rx="2" ry="2" />
+<text  x="15.09" y="479.5" ></text>
+</g>
+<g >
+<title>crypto/x509.(*Certificate).buildChains.func1 (12 samples, 0.01%)</title><rect x="1187.6" y="405" width="0.1" height="15.0" fill="rgb(251,227,54)" rx="2" ry="2" />
+<text  x="1190.63" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (213 samples, 0.16%)</title><rect x="1179.1" y="421" width="1.9" height="15.0" fill="rgb(229,229,32)" rx="2" ry="2" />
+<text  x="1182.13" y="431.5" ></text>
+</g>
+<g >
+<title>runtime.futex (26 samples, 0.02%)</title><rect x="11.0" y="517" width="0.3" height="15.0" fill="rgb(250,151,50)" rx="2" ry="2" />
+<text  x="14.04" y="527.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/base.(*LogObject).Tracef (30 samples, 0.02%)</title><rect x="1167.4" y="501" width="0.3" height="15.0" fill="rgb(207,13,32)" rx="2" ry="2" />
+<text  x="1170.39" y="511.5" ></text>
+</g>
+<g >
+<title>[ld-musl-x86_64.so.1] (100 samples, 0.07%)</title><rect x="18.3" y="565" width="0.8" height="15.0" fill="rgb(251,216,45)" rx="2" ry="2" />
+<text  x="21.27" y="575.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/api/services/diff/v1._Diff_Apply_Handler.func1 (431 samples, 0.32%)</title><rect x="14.3" y="469" width="3.8" height="15.0" fill="rgb(211,208,45)" rx="2" ry="2" />
+<text  x="17.32" y="479.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/vendor/github.com/containerd/continuity/fs.walkLinks (12 samples, 0.01%)</title><rect x="16.8" y="325" width="0.1" height="15.0" fill="rgb(224,99,26)" rx="2" ry="2" />
+<text  x="19.84" y="335.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="23.0" y="389" width="0.1" height="15.0" fill="rgb(244,213,33)" rx="2" ry="2" />
+<text  x="26.02" y="399.5" ></text>
+</g>
+<g >
+<title>[unknown] (184 samples, 0.14%)</title><rect x="1179.4" y="357" width="1.6" height="15.0" fill="rgb(218,218,8)" rx="2" ry="2" />
+<text  x="1182.38" y="367.5" ></text>
+</g>
+<g >
+<title>runtime.sysmon (81 samples, 0.06%)</title><rect x="1165.7" y="485" width="0.7" height="15.0" fill="rgb(217,163,34)" rx="2" ry="2" />
+<text  x="1168.68" y="495.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/api/services/diff/v1._Diff_Apply_Handler (431 samples, 0.32%)</title><rect x="14.3" y="501" width="3.8" height="15.0" fill="rgb(227,156,7)" rx="2" ry="2" />
+<text  x="17.32" y="511.5" ></text>
+</g>
+<g >
+<title>bufio.(*Reader).Read (17 samples, 0.01%)</title><rect x="1183.8" y="405" width="0.2" height="15.0" fill="rgb(240,48,8)" rx="2" ry="2" />
+<text  x="1186.84" y="415.5" ></text>
+</g>
+<g >
+<title>runtime.runOneTimer (16 samples, 0.01%)</title><rect x="1188.2" y="421" width="0.2" height="15.0" fill="rgb(222,177,30)" rx="2" ry="2" />
+<text  x="1191.24" y="431.5" ></text>
+</g>
+<g >
+<title>runtime.sysmon (27 samples, 0.02%)</title><rect x="11.3" y="533" width="0.2" height="15.0" fill="rgb(219,137,18)" rx="2" ry="2" />
+<text  x="14.31" y="543.5" ></text>
+</g>
+<g >
+<title>crypto/rsa.VerifyPKCS1v15 (14 samples, 0.01%)</title><rect x="1187.9" y="421" width="0.1" height="15.0" fill="rgb(205,178,14)" rx="2" ry="2" />
+<text  x="1190.91" y="431.5" ></text>
+</g>
+<g >
+<title>github.com/sirupsen/logrus.(*Logger).WithFields (28 samples, 0.02%)</title><rect x="1167.4" y="485" width="0.3" height="15.0" fill="rgb(212,22,2)" rx="2" ry="2" />
+<text  x="1170.41" y="495.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/zedrouter.Run (35 samples, 0.03%)</title><rect x="1187.1" y="533" width="0.4" height="15.0" fill="rgb(229,146,25)" rx="2" ry="2" />
+<text  x="1190.15" y="543.5" ></text>
+</g>
+<g >
+<title>runtime.gentraceback (12 samples, 0.01%)</title><rect x="10.2" y="421" width="0.1" height="15.0" fill="rgb(242,93,47)" rx="2" ry="2" />
+<text  x="13.23" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,273 samples, 0.94%)</title><rect x="1167.8" y="341" width="11.1" height="15.0" fill="rgb(250,63,31)" rx="2" ry="2" />
+<text  x="1170.85" y="351.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/services/content/contentserver.(*service).Write (27 samples, 0.02%)</title><rect x="14.1" y="469" width="0.2" height="15.0" fill="rgb(231,58,22)" rx="2" ry="2" />
+<text  x="17.07" y="479.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/types.ProcessMetric.LogModify (13 samples, 0.01%)</title><rect x="1186.4" y="469" width="0.1" height="15.0" fill="rgb(245,82,11)" rx="2" ry="2" />
+<text  x="1189.36" y="479.5" ></text>
+</g>
+<g >
+<title>runtime.findrunnable (14 samples, 0.01%)</title><rect x="13.7" y="469" width="0.1" height="15.0" fill="rgb(206,141,48)" rx="2" ry="2" />
+<text  x="16.68" y="479.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive.applyNaive (309 samples, 0.23%)</title><rect x="14.3" y="357" width="2.7" height="15.0" fill="rgb(245,178,49)" rx="2" ry="2" />
+<text  x="17.32" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (748 samples, 0.55%)</title><rect x="35.9" y="389" width="6.5" height="15.0" fill="rgb(246,121,0)" rx="2" ry="2" />
+<text  x="38.94" y="399.5" ></text>
+</g>
+<g >
+<title>[ld-musl-x86_64.so.1] (809 samples, 0.60%)</title><rect x="24.8" y="549" width="7.1" height="15.0" fill="rgb(207,152,16)" rx="2" ry="2" />
+<text  x="27.84" y="559.5" ></text>
+</g>
+<g >
+<title>crypto/sha256.block (135 samples, 0.10%)</title><rect x="12.3" y="549" width="1.2" height="15.0" fill="rgb(252,48,34)" rx="2" ry="2" />
+<text  x="15.34" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (50 samples, 0.04%)</title><rect x="1165.0" y="277" width="0.5" height="15.0" fill="rgb(220,93,21)" rx="2" ry="2" />
+<text  x="1168.02" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.scanstack (25 samples, 0.02%)</title><rect x="1188.9" y="469" width="0.2" height="15.0" fill="rgb(251,146,43)" rx="2" ry="2" />
+<text  x="1191.87" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="11.1" y="469" width="0.2" height="15.0" fill="rgb(254,45,7)" rx="2" ry="2" />
+<text  x="14.05" y="479.5" ></text>
+</g>
+<g >
+<title>runtime.goexit (2,628 samples, 1.94%)</title><rect x="1167.1" y="565" width="22.9" height="15.0" fill="rgb(241,97,53)" rx="2" ry="2" />
+<text  x="1170.11" y="575.5" >r..</text>
+</g>
+<g >
+<title>math/big.(*Int).Exp (13 samples, 0.01%)</title><rect x="1187.9" y="389" width="0.1" height="15.0" fill="rgb(247,55,46)" rx="2" ry="2" />
+<text  x="1190.91" y="399.5" ></text>
+</g>
+<g >
+<title>io.(*teeReader).Read (207 samples, 0.15%)</title><rect x="14.4" y="261" width="1.8" height="15.0" fill="rgb(249,216,16)" rx="2" ry="2" />
+<text  x="17.42" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,287 samples, 0.95%)</title><rect x="1167.7" y="421" width="11.2" height="15.0" fill="rgb(211,71,43)" rx="2" ry="2" />
+<text  x="1170.73" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,277 samples, 0.94%)</title><rect x="1167.8" y="357" width="11.1" height="15.0" fill="rgb(210,64,0)" rx="2" ry="2" />
+<text  x="1170.81" y="367.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/zedUpload/ociutil.(*ProgressWriter).Write (27 samples, 0.02%)</title><rect x="1184.0" y="517" width="0.2" height="15.0" fill="rgb(216,143,36)" rx="2" ry="2" />
+<text  x="1186.99" y="527.5" ></text>
+</g>
+<g >
+<title>runtime.goexit (545 samples, 0.40%)</title><rect x="13.5" y="565" width="4.8" height="15.0" fill="rgb(250,64,30)" rx="2" ry="2" />
+<text  x="16.52" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="11.4" y="405" width="0.1" height="15.0" fill="rgb(217,89,21)" rx="2" ry="2" />
+<text  x="14.44" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (23 samples, 0.02%)</title><rect x="11.1" y="453" width="0.2" height="15.0" fill="rgb(251,193,2)" rx="2" ry="2" />
+<text  x="14.07" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (301 samples, 0.22%)</title><rect x="10.9" y="565" width="2.6" height="15.0" fill="rgb(242,215,36)" rx="2" ry="2" />
+<text  x="13.90" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (87 samples, 0.06%)</title><rect x="1181.2" y="389" width="0.7" height="15.0" fill="rgb(217,175,14)" rx="2" ry="2" />
+<text  x="1184.17" y="399.5" ></text>
+</g>
+<g >
+<title>os.chmod (14 samples, 0.01%)</title><rect x="16.6" y="309" width="0.1" height="15.0" fill="rgb(246,173,29)" rx="2" ry="2" />
+<text  x="19.62" y="319.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/vendor/google.golang.org/grpc.(*Server).serveStreams.func1.1 (473 samples, 0.35%)</title><rect x="14.1" y="549" width="4.1" height="15.0" fill="rgb(220,207,42)" rx="2" ry="2" />
+<text  x="17.05" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.02%)</title><rect x="22.8" y="565" width="0.2" height="15.0" fill="rgb(207,199,26)" rx="2" ry="2" />
+<text  x="25.76" y="575.5" ></text>
+</g>
+<g >
+<title>runtime.notetsleep (19 samples, 0.01%)</title><rect x="1165.7" y="469" width="0.2" height="15.0" fill="rgb(215,126,26)" rx="2" ry="2" />
+<text  x="1168.70" y="479.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).nextBlock (77 samples, 0.06%)</title><rect x="15.4" y="181" width="0.7" height="15.0" fill="rgb(237,222,53)" rx="2" ry="2" />
+<text  x="18.45" y="191.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive.copyBuffered (237 samples, 0.17%)</title><rect x="14.4" y="325" width="2.1" height="15.0" fill="rgb(208,10,42)" rx="2" ry="2" />
+<text  x="17.41" y="335.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="16.6" y="165" width="0.1" height="15.0" fill="rgb(227,169,34)" rx="2" ry="2" />
+<text  x="19.62" y="175.5" ></text>
+</g>
+<g >
+<title>crypto/tls.verifyHandshakeSignature (14 samples, 0.01%)</title><rect x="1187.9" y="437" width="0.1" height="15.0" fill="rgb(238,198,18)" rx="2" ry="2" />
+<text  x="1190.91" y="447.5" ></text>
+</g>
+<g >
+<title>crypto/x509.(*Certificate).Verify (17 samples, 0.01%)</title><rect x="1187.6" y="437" width="0.2" height="15.0" fill="rgb(218,166,21)" rx="2" ry="2" />
+<text  x="1190.63" y="447.5" ></text>
+</g>
+<g >
+<title>runtime.bgscavenge (39 samples, 0.03%)</title><rect x="1188.2" y="549" width="0.4" height="15.0" fill="rgb(215,65,47)" rx="2" ry="2" />
+<text  x="1191.23" y="559.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).huffmanBlock (23 samples, 0.02%)</title><rect x="17.4" y="133" width="0.2" height="15.0" fill="rgb(206,109,6)" rx="2" ry="2" />
+<text  x="20.42" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (51 samples, 0.04%)</title><rect x="42.0" y="293" width="0.4" height="15.0" fill="rgb(229,198,38)" rx="2" ry="2" />
+<text  x="45.00" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.usleep (43 samples, 0.03%)</title><rect x="1166.0" y="469" width="0.4" height="15.0" fill="rgb(254,88,13)" rx="2" ry="2" />
+<text  x="1169.01" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (49 samples, 0.04%)</title><rect x="24.0" y="453" width="0.4" height="15.0" fill="rgb(215,122,15)" rx="2" ry="2" />
+<text  x="27.01" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (543 samples, 0.40%)</title><rect x="1174.2" y="213" width="4.7" height="15.0" fill="rgb(246,174,20)" rx="2" ry="2" />
+<text  x="1177.20" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.01%)</title><rect x="1188.2" y="293" width="0.2" height="15.0" fill="rgb(245,44,21)" rx="2" ry="2" />
+<text  x="1191.24" y="303.5" ></text>
+</g>
+<g >
+<title>net/http.(*persistConn).Read (17 samples, 0.01%)</title><rect x="1183.8" y="389" width="0.2" height="15.0" fill="rgb(214,4,6)" rx="2" ry="2" />
+<text  x="1186.84" y="399.5" ></text>
+</g>
+<g >
+<title>memmove (19 samples, 0.01%)</title><rect x="42.5" y="565" width="0.2" height="15.0" fill="rgb(223,26,13)" rx="2" ry="2" />
+<text  x="45.49" y="575.5" ></text>
+</g>
+<g >
+<title>runtime.goexit (14 samples, 0.01%)</title><rect x="10.8" y="565" width="0.1" height="15.0" fill="rgb(233,38,18)" rx="2" ry="2" />
+<text  x="13.77" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (70 samples, 0.05%)</title><rect x="31.3" y="421" width="0.6" height="15.0" fill="rgb(236,108,45)" rx="2" ry="2" />
+<text  x="34.27" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (39 samples, 0.03%)</title><rect x="20.2" y="421" width="0.4" height="15.0" fill="rgb(231,73,9)" rx="2" ry="2" />
+<text  x="23.22" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (84 samples, 0.06%)</title><rect x="19.8" y="501" width="0.8" height="15.0" fill="rgb(245,222,4)" rx="2" ry="2" />
+<text  x="22.83" y="511.5" ></text>
+</g>
+<g >
+<title>encoding/json.(*encodeState).marshal (18 samples, 0.01%)</title><rect x="1182.5" y="501" width="0.2" height="15.0" fill="rgb(252,180,13)" rx="2" ry="2" />
+<text  x="1185.54" y="511.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/services/diff.(*service).Apply (431 samples, 0.32%)</title><rect x="14.3" y="453" width="3.8" height="15.0" fill="rgb(254,211,34)" rx="2" ry="2" />
+<text  x="17.32" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (868 samples, 0.64%)</title><rect x="1171.4" y="245" width="7.5" height="15.0" fill="rgb(236,188,17)" rx="2" ry="2" />
+<text  x="1174.37" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (19 samples, 0.01%)</title><rect x="1166.2" y="341" width="0.2" height="15.0" fill="rgb(210,189,53)" rx="2" ry="2" />
+<text  x="1169.22" y="351.5" ></text>
+</g>
+<g >
+<title>archive/tar.(*regFileReader).Read (208 samples, 0.15%)</title><rect x="14.4" y="293" width="1.8" height="15.0" fill="rgb(246,44,2)" rx="2" ry="2" />
+<text  x="17.41" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.scavengeSleep (39 samples, 0.03%)</title><rect x="1188.2" y="533" width="0.4" height="15.0" fill="rgb(240,84,42)" rx="2" ry="2" />
+<text  x="1191.23" y="543.5" ></text>
+</g>
+<g >
+<title>internal/poll.(*FD).Write.func1 (27 samples, 0.02%)</title><rect x="1184.0" y="453" width="0.2" height="15.0" fill="rgb(216,140,26)" rx="2" ry="2" />
+<text  x="1186.99" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="16.3" y="181" width="0.2" height="15.0" fill="rgb(227,49,10)" rx="2" ry="2" />
+<text  x="19.26" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (126 samples, 0.09%)</title><rect x="41.3" y="309" width="1.1" height="15.0" fill="rgb(222,131,14)" rx="2" ry="2" />
+<text  x="44.35" y="319.5" ></text>
+</g>
+<g >
+<title>[unknown] (17 samples, 0.01%)</title><rect x="20.4" y="357" width="0.2" height="15.0" fill="rgb(223,74,35)" rx="2" ry="2" />
+<text  x="23.42" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="31.8" y="357" width="0.1" height="15.0" fill="rgb(250,147,18)" rx="2" ry="2" />
+<text  x="34.75" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (46 samples, 0.03%)</title><rect x="34.2" y="421" width="0.4" height="15.0" fill="rgb(214,41,52)" rx="2" ry="2" />
+<text  x="37.18" y="431.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive.copyBuffered (85 samples, 0.06%)</title><rect x="17.0" y="293" width="0.8" height="15.0" fill="rgb(241,6,14)" rx="2" ry="2" />
+<text  x="20.05" y="303.5" ></text>
+</g>
+<g >
+<title>[unknown] (87 samples, 0.06%)</title><rect x="1178.2" y="69" width="0.7" height="15.0" fill="rgb(240,178,13)" rx="2" ry="2" />
+<text  x="1181.17" y="79.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/diff/apply.(*readCounter).Read (74 samples, 0.05%)</title><rect x="17.0" y="245" width="0.7" height="15.0" fill="rgb(245,108,49)" rx="2" ry="2" />
+<text  x="20.05" y="255.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/vendor/google.golang.org/grpc.(*Server).processStreamingRPC (29 samples, 0.02%)</title><rect x="14.1" y="517" width="0.2" height="15.0" fill="rgb(253,127,9)" rx="2" ry="2" />
+<text  x="17.05" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (79 samples, 0.06%)</title><rect x="19.9" y="485" width="0.7" height="15.0" fill="rgb(211,159,42)" rx="2" ry="2" />
+<text  x="22.88" y="495.5" ></text>
+</g>
+<g >
+<title>net/http.(*bodyEOFSignal).Read (17 samples, 0.01%)</title><rect x="1183.8" y="469" width="0.2" height="15.0" fill="rgb(248,167,30)" rx="2" ry="2" />
+<text  x="1186.84" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (34 samples, 0.03%)</title><rect x="1166.1" y="453" width="0.3" height="15.0" fill="rgb(245,211,5)" rx="2" ry="2" />
+<text  x="1169.09" y="463.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/pubsub.(*SubscriptionImpl).ProcessChange (37 samples, 0.03%)</title><rect x="1186.8" y="517" width="0.3" height="15.0" fill="rgb(221,34,47)" rx="2" ry="2" />
+<text  x="1189.77" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (128,997 samples, 95.12%)</title><rect x="43.1" y="565" width="1122.4" height="15.0" fill="rgb(211,130,28)" rx="2" ry="2" />
+<text  x="46.06" y="575.5" >[unknown]</text>
+</g>
+<g >
+<title>zedbox (2,795 samples, 2.06%)</title><rect x="1165.7" y="581" width="24.3" height="15.0" fill="rgb(244,37,24)" rx="2" ry="2" />
+<text  x="1168.68" y="591.5" >z..</text>
+</g>
+<g >
+<title>[unknown] (29 samples, 0.02%)</title><rect x="16.2" y="261" width="0.3" height="15.0" fill="rgb(215,86,37)" rx="2" ry="2" />
+<text  x="19.22" y="271.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/process.(*Process).fillFromStatusWithContext (31 samples, 0.02%)</title><rect x="1185.7" y="469" width="0.3" height="15.0" fill="rgb(207,171,16)" rx="2" ry="2" />
+<text  x="1188.68" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (53 samples, 0.04%)</title><rect x="24.0" y="469" width="0.4" height="15.0" fill="rgb(211,45,22)" rx="2" ry="2" />
+<text  x="26.97" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="1188.3" y="165" width="0.1" height="15.0" fill="rgb(209,80,39)" rx="2" ry="2" />
+<text  x="1191.26" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (19 samples, 0.01%)</title><rect x="1166.2" y="357" width="0.2" height="15.0" fill="rgb(244,155,53)" rx="2" ry="2" />
+<text  x="1169.22" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="23.0" y="533" width="0.1" height="15.0" fill="rgb(251,27,40)" rx="2" ry="2" />
+<text  x="26.01" y="543.5" ></text>
+</g>
+<g >
+<title>runtime.futex (18 samples, 0.01%)</title><rect x="1165.7" y="437" width="0.2" height="15.0" fill="rgb(229,35,34)" rx="2" ry="2" />
+<text  x="1168.71" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (32 samples, 0.02%)</title><rect x="1166.1" y="421" width="0.3" height="15.0" fill="rgb(237,21,48)" rx="2" ry="2" />
+<text  x="1169.11" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="31.8" y="341" width="0.1" height="15.0" fill="rgb(252,32,13)" rx="2" ry="2" />
+<text  x="34.77" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (17 samples, 0.01%)</title><rect x="20.4" y="341" width="0.2" height="15.0" fill="rgb(251,225,25)" rx="2" ry="2" />
+<text  x="23.42" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.02%)</title><rect x="16.2" y="197" width="0.3" height="15.0" fill="rgb(254,122,14)" rx="2" ry="2" />
+<text  x="19.25" y="207.5" ></text>
+</g>
+<g >
+<title>[unknown] (47 samples, 0.03%)</title><rect x="42.0" y="277" width="0.4" height="15.0" fill="rgb(253,0,34)" rx="2" ry="2" />
+<text  x="45.04" y="287.5" ></text>
+</g>
+<g >
+<title>[unknown] (359 samples, 0.26%)</title><rect x="1162.3" y="389" width="3.2" height="15.0" fill="rgb(217,175,19)" rx="2" ry="2" />
+<text  x="1165.33" y="399.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.01%)</title><rect x="1188.2" y="277" width="0.2" height="15.0" fill="rgb(240,59,10)" rx="2" ry="2" />
+<text  x="1191.24" y="287.5" ></text>
+</g>
+<g >
+<title>[unknown] (55 samples, 0.04%)</title><rect x="34.1" y="517" width="0.5" height="15.0" fill="rgb(251,125,23)" rx="2" ry="2" />
+<text  x="37.10" y="527.5" ></text>
+</g>
+<g >
+<title>runtime.greyobject (12 samples, 0.01%)</title><rect x="11.9" y="469" width="0.1" height="15.0" fill="rgb(243,141,45)" rx="2" ry="2" />
+<text  x="14.92" y="479.5" ></text>
+</g>
+<g >
+<title>runtime.usleep (19 samples, 0.01%)</title><rect x="11.4" y="517" width="0.1" height="15.0" fill="rgb(208,120,2)" rx="2" ry="2" />
+<text  x="14.38" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="11.4" y="453" width="0.1" height="15.0" fill="rgb(233,166,53)" rx="2" ry="2" />
+<text  x="14.44" y="463.5" ></text>
+</g>
+<g >
+<title>net/http.(*persistConn).addTLS.func2 (61 samples, 0.04%)</title><rect x="1187.5" y="549" width="0.6" height="15.0" fill="rgb(249,212,41)" rx="2" ry="2" />
+<text  x="1190.54" y="559.5" ></text>
+</g>
+<g >
+<title>crypto/tls.(*Conn).Handshake (60 samples, 0.04%)</title><rect x="1187.5" y="533" width="0.6" height="15.0" fill="rgb(253,4,8)" rx="2" ry="2" />
+<text  x="1190.54" y="543.5" ></text>
+</g>
+<g >
+<title>net/http.(*body).Read (17 samples, 0.01%)</title><rect x="1183.8" y="453" width="0.2" height="15.0" fill="rgb(224,58,16)" rx="2" ry="2" />
+<text  x="1186.84" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="16.3" y="117" width="0.2" height="15.0" fill="rgb(238,120,37)" rx="2" ry="2" />
+<text  x="19.26" y="127.5" ></text>
+</g>
+<g >
+<title>encoding/json.(*decodeState).value (39 samples, 0.03%)</title><rect x="1183.0" y="421" width="0.3" height="15.0" fill="rgb(225,94,30)" rx="2" ry="2" />
+<text  x="1185.97" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.01%)</title><rect x="14.2" y="213" width="0.1" height="15.0" fill="rgb(240,76,14)" rx="2" ry="2" />
+<text  x="17.17" y="223.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/pubsub.handleModify (36 samples, 0.03%)</title><rect x="1186.8" y="501" width="0.3" height="15.0" fill="rgb(227,139,31)" rx="2" ry="2" />
+<text  x="1189.78" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (27 samples, 0.02%)</title><rect x="1184.0" y="325" width="0.2" height="15.0" fill="rgb(245,42,25)" rx="2" ry="2" />
+<text  x="1186.99" y="335.5" ></text>
+</g>
+<g >
+<title>[unknown] (34 samples, 0.03%)</title><rect x="24.1" y="405" width="0.3" height="15.0" fill="rgb(250,218,33)" rx="2" ry="2" />
+<text  x="27.14" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="11.4" y="469" width="0.1" height="15.0" fill="rgb(244,177,4)" rx="2" ry="2" />
+<text  x="14.42" y="479.5" ></text>
+</g>
+<g >
+<title>runtime.scanobject (67 samples, 0.05%)</title><rect x="1189.4" y="501" width="0.6" height="15.0" fill="rgb(211,30,31)" rx="2" ry="2" />
+<text  x="1192.39" y="511.5" ></text>
+</g>
+<g >
+<title>runtime.futex (14 samples, 0.01%)</title><rect x="1188.2" y="309" width="0.2" height="15.0" fill="rgb(236,167,39)" rx="2" ry="2" />
+<text  x="1191.24" y="319.5" ></text>
+</g>
+<g >
+<title>[unknown] (216 samples, 0.16%)</title><rect x="1179.1" y="485" width="1.9" height="15.0" fill="rgb(225,26,13)" rx="2" ry="2" />
+<text  x="1182.11" y="495.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/process.(*Process).NumFDsWithContext (14 samples, 0.01%)</title><rect x="1185.6" y="485" width="0.1" height="15.0" fill="rgb(211,101,12)" rx="2" ry="2" />
+<text  x="1188.56" y="495.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/process.(*Process).fillFromfdListWithContext (14 samples, 0.01%)</title><rect x="1185.6" y="469" width="0.1" height="15.0" fill="rgb(251,153,12)" rx="2" ry="2" />
+<text  x="1188.56" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="14.2" y="245" width="0.1" height="15.0" fill="rgb(243,161,25)" rx="2" ry="2" />
+<text  x="17.16" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (17 samples, 0.01%)</title><rect x="24.3" y="373" width="0.1" height="15.0" fill="rgb(254,174,7)" rx="2" ry="2" />
+<text  x="27.29" y="383.5" ></text>
+</g>
+<g >
+<title>kworker/u8:3-fl (17 samples, 0.01%)</title><rect x="23.0" y="581" width="0.1" height="15.0" fill="rgb(237,147,34)" rx="2" ry="2" />
+<text  x="26.00" y="591.5" ></text>
+</g>
+<g >
+<title>runtime.injectglist.func1 (14 samples, 0.01%)</title><rect x="1188.2" y="357" width="0.2" height="15.0" fill="rgb(213,104,11)" rx="2" ry="2" />
+<text  x="1191.24" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="14.2" y="261" width="0.1" height="15.0" fill="rgb(244,111,50)" rx="2" ry="2" />
+<text  x="17.16" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (58 samples, 0.04%)</title><rect x="11.5" y="533" width="0.6" height="15.0" fill="rgb(253,228,53)" rx="2" ry="2" />
+<text  x="14.55" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (719 samples, 0.53%)</title><rect x="25.6" y="533" width="6.3" height="15.0" fill="rgb(242,136,49)" rx="2" ry="2" />
+<text  x="28.63" y="543.5" ></text>
+</g>
+<g >
+<title>ioctl (889 samples, 0.66%)</title><rect x="34.7" y="565" width="7.7" height="15.0" fill="rgb(243,187,10)" rx="2" ry="2" />
+<text  x="37.71" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (27 samples, 0.02%)</title><rect x="1184.0" y="389" width="0.2" height="15.0" fill="rgb(217,120,13)" rx="2" ry="2" />
+<text  x="1186.99" y="399.5" ></text>
+</g>
+<g >
+<title>syscall.Syscall (27 samples, 0.02%)</title><rect x="1184.0" y="437" width="0.2" height="15.0" fill="rgb(248,60,4)" rx="2" ry="2" />
+<text  x="1186.99" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="1165.3" y="149" width="0.2" height="15.0" fill="rgb(234,2,45)" rx="2" ry="2" />
+<text  x="1168.34" y="159.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive.Apply (309 samples, 0.23%)</title><rect x="14.3" y="373" width="2.7" height="15.0" fill="rgb(250,51,38)" rx="2" ry="2" />
+<text  x="17.32" y="383.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="1165.3" y="133" width="0.2" height="15.0" fill="rgb(249,229,7)" rx="2" ry="2" />
+<text  x="1168.34" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="24.3" y="357" width="0.1" height="15.0" fill="rgb(254,173,13)" rx="2" ry="2" />
+<text  x="27.30" y="367.5" ></text>
+</g>
+<g >
+<title>runtime.markroot (25 samples, 0.02%)</title><rect x="10.2" y="485" width="0.2" height="15.0" fill="rgb(213,79,5)" rx="2" ry="2" />
+<text  x="13.22" y="495.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/gc/scheduler.(*gcScheduler).run (37 samples, 0.03%)</title><rect x="13.5" y="549" width="0.3" height="15.0" fill="rgb(242,201,38)" rx="2" ry="2" />
+<text  x="16.52" y="559.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/utils/file.WriteRename (14 samples, 0.01%)</title><rect x="1186.2" y="469" width="0.2" height="15.0" fill="rgb(254,56,40)" rx="2" ry="2" />
+<text  x="1189.24" y="479.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/ledmanager.ExecuteDDCmd (1,677 samples, 1.24%)</title><rect x="1167.4" y="533" width="14.6" height="15.0" fill="rgb(220,120,9)" rx="2" ry="2" />
+<text  x="1170.36" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (45 samples, 0.03%)</title><rect x="24.0" y="421" width="0.4" height="15.0" fill="rgb(232,129,29)" rx="2" ry="2" />
+<text  x="27.04" y="431.5" ></text>
+</g>
+<g >
+<title>encoding/json.Marshal (20 samples, 0.01%)</title><rect x="1182.5" y="517" width="0.2" height="15.0" fill="rgb(224,229,3)" rx="2" ry="2" />
+<text  x="1185.54" y="527.5" ></text>
+</g>
+<g >
+<title>runtime.markroot.func1 (17 samples, 0.01%)</title><rect x="10.2" y="469" width="0.2" height="15.0" fill="rgb(212,142,6)" rx="2" ry="2" />
+<text  x="13.22" y="479.5" ></text>
+</g>
+<g >
+<title>runtime.park_m (21 samples, 0.02%)</title><rect x="13.7" y="501" width="0.1" height="15.0" fill="rgb(215,81,14)" rx="2" ry="2" />
+<text  x="16.66" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (876 samples, 0.65%)</title><rect x="34.8" y="533" width="7.6" height="15.0" fill="rgb(240,138,4)" rx="2" ry="2" />
+<text  x="37.82" y="543.5" ></text>
+</g>
+<g >
+<title>runtime.mcall (38 samples, 0.03%)</title><rect x="1188.2" y="517" width="0.4" height="15.0" fill="rgb(233,68,22)" rx="2" ry="2" />
+<text  x="1191.23" y="527.5" ></text>
+</g>
+<g >
+<title>containerd (847 samples, 0.62%)</title><rect x="10.9" y="581" width="7.4" height="15.0" fill="rgb(229,225,15)" rx="2" ry="2" />
+<text  x="13.90" y="591.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/types.(*ProcessMetric).LogModify (13 samples, 0.01%)</title><rect x="1186.4" y="485" width="0.1" height="15.0" fill="rgb(213,114,35)" rx="2" ry="2" />
+<text  x="1189.36" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (205 samples, 0.15%)</title><rect x="1163.7" y="325" width="1.8" height="15.0" fill="rgb(229,129,1)" rx="2" ry="2" />
+<text  x="1166.67" y="335.5" ></text>
+</g>
+<g >
+<title>encoding/json.(*decodeState).literalStore (17 samples, 0.01%)</title><rect x="1183.0" y="373" width="0.2" height="15.0" fill="rgb(246,11,25)" rx="2" ry="2" />
+<text  x="1186.03" y="383.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/pubsub.(*PublicationImpl).GetAll.func1 (80 samples, 0.06%)</title><rect x="1182.8" y="485" width="0.7" height="15.0" fill="rgb(213,160,39)" rx="2" ry="2" />
+<text  x="1185.79" y="495.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/volumemgr.diskMetricsTimerTask (23 samples, 0.02%)</title><rect x="1182.1" y="549" width="0.2" height="15.0" fill="rgb(243,50,35)" rx="2" ry="2" />
+<text  x="1185.07" y="559.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/ledmanager.TriggerBlinkOnDevice (1,681 samples, 1.24%)</title><rect x="1167.4" y="549" width="14.6" height="15.0" fill="rgb(242,48,42)" rx="2" ry="2" />
+<text  x="1170.35" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (102 samples, 0.08%)</title><rect x="1178.0" y="117" width="0.9" height="15.0" fill="rgb(220,136,4)" rx="2" ry="2" />
+<text  x="1181.04" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="24.3" y="341" width="0.1" height="15.0" fill="rgb(205,123,22)" rx="2" ry="2" />
+<text  x="27.30" y="351.5" ></text>
+</g>
+<g >
+<title>syscall.Syscall6 (222 samples, 0.16%)</title><rect x="1179.1" y="501" width="1.9" height="15.0" fill="rgb(250,129,47)" rx="2" ry="2" />
+<text  x="1182.09" y="511.5" ></text>
+</g>
+<g >
+<title>runtime.(*pageAlloc).scavengeRangeLocked (12 samples, 0.01%)</title><rect x="1188.7" y="485" width="0.1" height="15.0" fill="rgb(234,133,20)" rx="2" ry="2" />
+<text  x="1191.72" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (87 samples, 0.06%)</title><rect x="19.8" y="549" width="0.8" height="15.0" fill="rgb(220,56,26)" rx="2" ry="2" />
+<text  x="22.81" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (87 samples, 0.06%)</title><rect x="19.8" y="517" width="0.8" height="15.0" fill="rgb(220,108,25)" rx="2" ry="2" />
+<text  x="22.81" y="527.5" ></text>
+</g>
+<g >
+<title>internal/poll.(*FD).Write (15 samples, 0.01%)</title><rect x="14.2" y="405" width="0.1" height="15.0" fill="rgb(235,143,40)" rx="2" ry="2" />
+<text  x="17.16" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (49 samples, 0.04%)</title><rect x="34.2" y="485" width="0.4" height="15.0" fill="rgb(210,114,16)" rx="2" ry="2" />
+<text  x="37.15" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.02%)</title><rect x="16.2" y="245" width="0.3" height="15.0" fill="rgb(211,215,13)" rx="2" ry="2" />
+<text  x="19.25" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,128 samples, 0.83%)</title><rect x="24.8" y="565" width="9.9" height="15.0" fill="rgb(249,8,0)" rx="2" ry="2" />
+<text  x="27.84" y="575.5" ></text>
+</g>
+<g >
+<title>math/big.nat.expNN (13 samples, 0.01%)</title><rect x="1187.9" y="373" width="0.1" height="15.0" fill="rgb(254,58,45)" rx="2" ry="2" />
+<text  x="1190.91" y="383.5" ></text>
+</g>
+<g >
+<title>crypto/tls.(*Conn).Read (16 samples, 0.01%)</title><rect x="1183.8" y="373" width="0.2" height="15.0" fill="rgb(214,111,8)" rx="2" ry="2" />
+<text  x="1186.84" y="383.5" ></text>
+</g>
+<g >
+<title>[unknown] (291 samples, 0.21%)</title><rect x="1176.4" y="181" width="2.5" height="15.0" fill="rgb(216,106,8)" rx="2" ry="2" />
+<text  x="1179.39" y="191.5" ></text>
+</g>
+<g >
+<title>kworker/3:1H-kb (26 samples, 0.02%)</title><rect x="22.8" y="581" width="0.2" height="15.0" fill="rgb(210,7,6)" rx="2" ry="2" />
+<text  x="25.76" y="591.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="1166.2" y="405" width="0.2" height="15.0" fill="rgb(208,157,37)" rx="2" ry="2" />
+<text  x="1169.17" y="415.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/pubsub/socketdriver.(*Publisher).Publish (14 samples, 0.01%)</title><rect x="1186.2" y="485" width="0.2" height="15.0" fill="rgb(220,55,21)" rx="2" ry="2" />
+<text  x="1189.24" y="495.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/process.(*Process).NumThreadsWithContext (31 samples, 0.02%)</title><rect x="1185.7" y="485" width="0.3" height="15.0" fill="rgb(226,1,29)" rx="2" ry="2" />
+<text  x="1188.68" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (687 samples, 0.51%)</title><rect x="1159.5" y="437" width="6.0" height="15.0" fill="rgb(245,30,50)" rx="2" ry="2" />
+<text  x="1162.48" y="447.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/pubsub.(*PublicationImpl).Publish (46 samples, 0.03%)</title><rect x="1186.1" y="501" width="0.4" height="15.0" fill="rgb(232,21,3)" rx="2" ry="2" />
+<text  x="1189.08" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (23 samples, 0.02%)</title><rect x="22.8" y="469" width="0.2" height="15.0" fill="rgb(228,18,30)" rx="2" ry="2" />
+<text  x="25.79" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.02%)</title><rect x="16.2" y="213" width="0.3" height="15.0" fill="rgb(242,48,50)" rx="2" ry="2" />
+<text  x="19.25" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (46 samples, 0.03%)</title><rect x="34.2" y="405" width="0.4" height="15.0" fill="rgb(238,202,51)" rx="2" ry="2" />
+<text  x="37.18" y="415.5" ></text>
+</g>
+<g >
+<title>encoding/json.Unmarshal (55 samples, 0.04%)</title><rect x="1183.0" y="453" width="0.4" height="15.0" fill="rgb(211,166,16)" rx="2" ry="2" />
+<text  x="1185.97" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="1188.3" y="229" width="0.1" height="15.0" fill="rgb(212,12,14)" rx="2" ry="2" />
+<text  x="1191.25" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (20 samples, 0.01%)</title><rect x="1166.2" y="373" width="0.2" height="15.0" fill="rgb(246,176,14)" rx="2" ry="2" />
+<text  x="1169.21" y="383.5" ></text>
+</g>
+<g >
+<title>[unknown] (928 samples, 0.68%)</title><rect x="1170.8" y="261" width="8.1" height="15.0" fill="rgb(228,129,13)" rx="2" ry="2" />
+<text  x="1173.85" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (32 samples, 0.02%)</title><rect x="20.3" y="405" width="0.3" height="15.0" fill="rgb(221,149,28)" rx="2" ry="2" />
+<text  x="23.28" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (55 samples, 0.04%)</title><rect x="31.4" y="405" width="0.5" height="15.0" fill="rgb(210,63,7)" rx="2" ry="2" />
+<text  x="34.40" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (23 samples, 0.02%)</title><rect x="22.8" y="453" width="0.2" height="15.0" fill="rgb(240,143,40)" rx="2" ry="2" />
+<text  x="25.79" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (454 samples, 0.33%)</title><rect x="1175.0" y="197" width="3.9" height="15.0" fill="rgb(206,78,30)" rx="2" ry="2" />
+<text  x="1177.97" y="207.5" ></text>
+</g>
+<g >
+<title>main.startAgentAndDone (356 samples, 0.26%)</title><rect x="1184.4" y="549" width="3.1" height="15.0" fill="rgb(223,86,39)" rx="2" ry="2" />
+<text  x="1187.35" y="559.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).Read (70 samples, 0.05%)</title><rect x="17.1" y="165" width="0.6" height="15.0" fill="rgb(205,200,9)" rx="2" ry="2" />
+<text  x="20.06" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (22 samples, 0.02%)</title><rect x="20.4" y="373" width="0.2" height="15.0" fill="rgb(216,52,15)" rx="2" ry="2" />
+<text  x="23.37" y="383.5" ></text>
+</g>
+<g >
+<title>[unknown] (31 samples, 0.02%)</title><rect x="31.6" y="373" width="0.3" height="15.0" fill="rgb(238,207,30)" rx="2" ry="2" />
+<text  x="34.61" y="383.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.01%)</title><rect x="16.4" y="69" width="0.1" height="15.0" fill="rgb(217,126,19)" rx="2" ry="2" />
+<text  x="19.35" y="79.5" ></text>
+</g>
+<g >
+<title>[unknown] (53 samples, 0.04%)</title><rect x="34.1" y="501" width="0.5" height="15.0" fill="rgb(253,228,38)" rx="2" ry="2" />
+<text  x="37.12" y="511.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/pubsub.(*PublicationImpl).GetAll (84 samples, 0.06%)</title><rect x="1182.8" y="517" width="0.7" height="15.0" fill="rgb(209,109,45)" rx="2" ry="2" />
+<text  x="1185.79" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (870 samples, 0.64%)</title><rect x="34.9" y="501" width="7.5" height="15.0" fill="rgb(214,25,54)" rx="2" ry="2" />
+<text  x="37.88" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,280 samples, 0.94%)</title><rect x="1167.8" y="373" width="11.1" height="15.0" fill="rgb(248,102,15)" rx="2" ry="2" />
+<text  x="1170.79" y="383.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive.Apply (122 samples, 0.09%)</title><rect x="17.0" y="341" width="1.1" height="15.0" fill="rgb(213,160,24)" rx="2" ry="2" />
+<text  x="20.00" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (687 samples, 0.51%)</title><rect x="1159.5" y="469" width="6.0" height="15.0" fill="rgb(216,97,19)" rx="2" ry="2" />
+<text  x="1162.48" y="479.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive/compression.(*readCloserWrapper).Read (207 samples, 0.15%)</title><rect x="14.4" y="229" width="1.8" height="15.0" fill="rgb(206,93,32)" rx="2" ry="2" />
+<text  x="17.42" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="16.6" y="229" width="0.1" height="15.0" fill="rgb(216,153,24)" rx="2" ry="2" />
+<text  x="19.62" y="239.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/process.(*Process).CPUPercentWithContext (19 samples, 0.01%)</title><rect x="1184.4" y="485" width="0.1" height="15.0" fill="rgb(238,133,42)" rx="2" ry="2" />
+<text  x="1187.38" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.01%)</title><rect x="33.4" y="533" width="0.1" height="15.0" fill="rgb(230,222,23)" rx="2" ry="2" />
+<text  x="36.40" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,285 samples, 0.95%)</title><rect x="1167.7" y="405" width="11.2" height="15.0" fill="rgb(221,68,36)" rx="2" ry="2" />
+<text  x="1170.74" y="415.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/diff/apply.(*readCounter).Read (207 samples, 0.15%)</title><rect x="14.4" y="277" width="1.8" height="15.0" fill="rgb(210,61,31)" rx="2" ry="2" />
+<text  x="17.42" y="287.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.02%)</title><rect x="1184.0" y="277" width="0.2" height="15.0" fill="rgb(231,62,4)" rx="2" ry="2" />
+<text  x="1187.00" y="287.5" ></text>
+</g>
+<g >
+<title>[unknown] (166 samples, 0.12%)</title><rect x="10.9" y="549" width="1.4" height="15.0" fill="rgb(215,209,35)" rx="2" ry="2" />
+<text  x="13.90" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="11.4" y="421" width="0.1" height="15.0" fill="rgb(229,104,16)" rx="2" ry="2" />
+<text  x="14.44" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (104 samples, 0.08%)</title><rect x="1181.0" y="469" width="0.9" height="15.0" fill="rgb(236,87,1)" rx="2" ry="2" />
+<text  x="1184.02" y="479.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/gc/scheduler.schedule (12 samples, 0.01%)</title><rect x="13.5" y="533" width="0.1" height="15.0" fill="rgb(237,165,31)" rx="2" ry="2" />
+<text  x="16.54" y="543.5" ></text>
+</g>
+<g >
+<title>runtime.timerproc (33 samples, 0.02%)</title><rect x="12.1" y="533" width="0.2" height="15.0" fill="rgb(213,73,42)" rx="2" ry="2" />
+<text  x="15.05" y="543.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/domainmgr.Run (247 samples, 0.18%)</title><rect x="1184.4" y="533" width="2.1" height="15.0" fill="rgb(206,184,4)" rx="2" ry="2" />
+<text  x="1187.38" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (656 samples, 0.48%)</title><rect x="26.2" y="485" width="5.7" height="15.0" fill="rgb(252,36,5)" rx="2" ry="2" />
+<text  x="29.18" y="495.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).huffmanBlock (60 samples, 0.04%)</title><rect x="15.5" y="165" width="0.5" height="15.0" fill="rgb(210,199,23)" rx="2" ry="2" />
+<text  x="18.46" y="175.5" ></text>
+</g>
+<g >
+<title>syscall.Syscall (107 samples, 0.08%)</title><rect x="1181.0" y="501" width="1.0" height="15.0" fill="rgb(233,212,30)" rx="2" ry="2" />
+<text  x="1184.02" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (702 samples, 0.52%)</title><rect x="25.8" y="501" width="6.1" height="15.0" fill="rgb(210,111,21)" rx="2" ry="2" />
+<text  x="28.77" y="511.5" ></text>
+</g>
+<g >
+<title>memlogd (16 samples, 0.01%)</title><rect x="23.2" y="581" width="0.1" height="15.0" fill="rgb(231,141,47)" rx="2" ry="2" />
+<text  x="26.16" y="591.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="23.0" y="437" width="0.1" height="15.0" fill="rgb(230,62,47)" rx="2" ry="2" />
+<text  x="26.01" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (104 samples, 0.08%)</title><rect x="1181.0" y="453" width="0.9" height="15.0" fill="rgb(226,3,46)" rx="2" ry="2" />
+<text  x="1184.02" y="463.5" ></text>
+</g>
+<g >
+<title>runtime.selectgo (23 samples, 0.02%)</title><rect x="13.6" y="533" width="0.2" height="15.0" fill="rgb(241,101,18)" rx="2" ry="2" />
+<text  x="16.65" y="543.5" ></text>
+</g>
+<g >
+<title>runtime.checkTimers (18 samples, 0.01%)</title><rect x="1188.2" y="453" width="0.2" height="15.0" fill="rgb(249,117,3)" rx="2" ry="2" />
+<text  x="1191.23" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="23.0" y="549" width="0.1" height="15.0" fill="rgb(249,181,15)" rx="2" ry="2" />
+<text  x="26.01" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (687 samples, 0.51%)</title><rect x="1159.5" y="453" width="6.0" height="15.0" fill="rgb(218,46,21)" rx="2" ry="2" />
+<text  x="1162.48" y="463.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (65 samples, 0.05%)</title><rect x="10.2" y="533" width="0.6" height="15.0" fill="rgb(237,102,18)" rx="2" ry="2" />
+<text  x="13.19" y="543.5" ></text>
+</g>
+<g >
+<title>bufio.(*Reader).ReadByte (13 samples, 0.01%)</title><rect x="15.3" y="149" width="0.1" height="15.0" fill="rgb(218,35,40)" rx="2" ry="2" />
+<text  x="18.31" y="159.5" ></text>
+</g>
+<g >
+<title>runtime.gcBgMarkWorker.func2 (131 samples, 0.10%)</title><rect x="1188.8" y="533" width="1.2" height="15.0" fill="rgb(218,161,14)" rx="2" ry="2" />
+<text  x="1191.83" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (869 samples, 0.64%)</title><rect x="34.9" y="485" width="7.5" height="15.0" fill="rgb(243,82,0)" rx="2" ry="2" />
+<text  x="37.88" y="495.5" ></text>
+</g>
+<g >
+<title>github.com/google/go-containerregistry/pkg/v1/v1util.(*readAndCloser).Read (17 samples, 0.01%)</title><rect x="1183.8" y="517" width="0.2" height="15.0" fill="rgb(226,13,35)" rx="2" ry="2" />
+<text  x="1186.84" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (183 samples, 0.13%)</title><rect x="40.9" y="325" width="1.5" height="15.0" fill="rgb(214,226,19)" rx="2" ry="2" />
+<text  x="43.85" y="335.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/worker.(*Worker).processWork (15 samples, 0.01%)</title><rect x="1183.7" y="549" width="0.1" height="15.0" fill="rgb(225,142,38)" rx="2" ry="2" />
+<text  x="1186.66" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="23.0" y="517" width="0.1" height="15.0" fill="rgb(224,190,54)" rx="2" ry="2" />
+<text  x="26.01" y="527.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/vendor/google.golang.org/grpc.(*Server).handleStream (473 samples, 0.35%)</title><rect x="14.1" y="533" width="4.1" height="15.0" fill="rgb(234,123,39)" rx="2" ry="2" />
+<text  x="17.05" y="543.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/pubsub.deepCopy (79 samples, 0.06%)</title><rect x="1182.8" y="469" width="0.7" height="15.0" fill="rgb(225,153,39)" rx="2" ry="2" />
+<text  x="1185.79" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (32 samples, 0.02%)</title><rect x="1165.2" y="229" width="0.3" height="15.0" fill="rgb(226,33,32)" rx="2" ry="2" />
+<text  x="1168.18" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (862 samples, 0.64%)</title><rect x="34.9" y="437" width="7.5" height="15.0" fill="rgb(228,141,35)" rx="2" ry="2" />
+<text  x="37.95" y="447.5" ></text>
+</g>
+<g >
+<title>encoding/json.(*decodeState).object (37 samples, 0.03%)</title><rect x="1183.0" y="405" width="0.3" height="15.0" fill="rgb(246,219,31)" rx="2" ry="2" />
+<text  x="1185.97" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (213 samples, 0.16%)</title><rect x="1179.1" y="405" width="1.9" height="15.0" fill="rgb(225,141,10)" rx="2" ry="2" />
+<text  x="1182.13" y="415.5" ></text>
+</g>
+<g >
+<title>archive/tar.(*Reader).Read (74 samples, 0.05%)</title><rect x="17.0" y="277" width="0.7" height="15.0" fill="rgb(219,161,7)" rx="2" ry="2" />
+<text  x="20.05" y="287.5" ></text>
+</g>
+<g >
+<title>encoding/json.Marshal (21 samples, 0.02%)</title><rect x="1182.8" y="453" width="0.2" height="15.0" fill="rgb(253,41,3)" rx="2" ry="2" />
+<text  x="1185.79" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="1165.8" y="325" width="0.1" height="15.0" fill="rgb(219,143,38)" rx="2" ry="2" />
+<text  x="1168.76" y="335.5" ></text>
+</g>
+<g >
+<title>[unknown] (27 samples, 0.02%)</title><rect x="1184.0" y="309" width="0.2" height="15.0" fill="rgb(251,6,39)" rx="2" ry="2" />
+<text  x="1186.99" y="319.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/domainmgr.getProcessMetric (191 samples, 0.14%)</title><rect x="1184.4" y="501" width="1.6" height="15.0" fill="rgb(224,65,8)" rx="2" ry="2" />
+<text  x="1187.38" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (195 samples, 0.14%)</title><rect x="1179.3" y="373" width="1.7" height="15.0" fill="rgb(231,128,2)" rx="2" ry="2" />
+<text  x="1182.29" y="383.5" ></text>
+</g>
+<g >
+<title>[unknown] (27 samples, 0.02%)</title><rect x="1184.0" y="293" width="0.2" height="15.0" fill="rgb(229,45,23)" rx="2" ry="2" />
+<text  x="1186.99" y="303.5" ></text>
+</g>
+<g >
+<title>in:imemlogd (19 samples, 0.01%)</title><rect x="19.2" y="581" width="0.2" height="15.0" fill="rgb(251,121,35)" rx="2" ry="2" />
+<text  x="22.22" y="591.5" ></text>
+</g>
+<g >
+<title>[unknown] (55 samples, 0.04%)</title><rect x="34.1" y="533" width="0.5" height="15.0" fill="rgb(239,115,34)" rx="2" ry="2" />
+<text  x="37.10" y="543.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/process.(*Process).fillFromStatmWithContext (15 samples, 0.01%)</title><rect x="1185.1" y="453" width="0.2" height="15.0" fill="rgb(214,5,37)" rx="2" ry="2" />
+<text  x="1188.13" y="463.5" ></text>
+</g>
+<g >
+<title>syscall.Syscall (15 samples, 0.01%)</title><rect x="14.2" y="389" width="0.1" height="15.0" fill="rgb(244,211,29)" rx="2" ry="2" />
+<text  x="17.16" y="399.5" ></text>
+</g>
+<g >
+<title>runtime.notetsleep_internal (30 samples, 0.02%)</title><rect x="11.0" y="533" width="0.3" height="15.0" fill="rgb(226,118,26)" rx="2" ry="2" />
+<text  x="14.01" y="543.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).Read (205 samples, 0.15%)</title><rect x="14.4" y="197" width="1.8" height="15.0" fill="rgb(235,116,47)" rx="2" ry="2" />
+<text  x="17.42" y="207.5" ></text>
+</g>
+<g >
+<title>[unknown] (17 samples, 0.01%)</title><rect x="22.8" y="373" width="0.2" height="15.0" fill="rgb(241,91,12)" rx="2" ry="2" />
+<text  x="25.84" y="383.5" ></text>
+</g>
+<g >
+<title>runtime.chansend (12 samples, 0.01%)</title><rect x="12.2" y="485" width="0.1" height="15.0" fill="rgb(215,201,4)" rx="2" ry="2" />
+<text  x="15.24" y="495.5" ></text>
+</g>
+<g >
+<title>io/ioutil.ReadFile (20 samples, 0.01%)</title><rect x="1185.3" y="453" width="0.2" height="15.0" fill="rgb(241,138,21)" rx="2" ry="2" />
+<text  x="1188.30" y="463.5" ></text>
+</g>
+<g >
+<title>internal/poll.ignoringEINTR (27 samples, 0.02%)</title><rect x="1184.0" y="469" width="0.2" height="15.0" fill="rgb(247,21,36)" rx="2" ry="2" />
+<text  x="1186.99" y="479.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/volumemgr.createOrUpdateDiskMetrics (23 samples, 0.02%)</title><rect x="1182.1" y="533" width="0.2" height="15.0" fill="rgb(241,29,32)" rx="2" ry="2" />
+<text  x="1185.07" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="14.2" y="373" width="0.1" height="15.0" fill="rgb(210,116,36)" rx="2" ry="2" />
+<text  x="17.16" y="383.5" ></text>
+</g>
+<g >
+<title>[unknown] (104 samples, 0.08%)</title><rect x="1181.0" y="437" width="0.9" height="15.0" fill="rgb(247,178,9)" rx="2" ry="2" />
+<text  x="1184.02" y="447.5" ></text>
+</g>
+<g >
+<title>internal/poll.ignoringEINTR (1,302 samples, 0.96%)</title><rect x="1167.7" y="469" width="11.3" height="15.0" fill="rgb(224,225,46)" rx="2" ry="2" />
+<text  x="1170.71" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (68 samples, 0.05%)</title><rect x="21.7" y="565" width="0.6" height="15.0" fill="rgb(231,99,11)" rx="2" ry="2" />
+<text  x="24.67" y="575.5" ></text>
+</g>
+<g >
+<title>os.OpenFile (12 samples, 0.01%)</title><rect x="16.5" y="309" width="0.1" height="15.0" fill="rgb(243,12,18)" rx="2" ry="2" />
+<text  x="19.52" y="319.5" ></text>
+</g>
+<g >
+<title>[unknown] (18 samples, 0.01%)</title><rect x="22.8" y="405" width="0.2" height="15.0" fill="rgb(220,126,46)" rx="2" ry="2" />
+<text  x="25.83" y="415.5" ></text>
+</g>
+<g >
+<title>iptables (21 samples, 0.02%)</title><rect x="19.6" y="581" width="0.2" height="15.0" fill="rgb(205,19,30)" rx="2" ry="2" />
+<text  x="22.58" y="591.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/vendor/github.com/grpc-ecosystem/go-grpc-prometheus.(*ServerMetrics).StreamServerInterceptor.func1 (29 samples, 0.02%)</title><rect x="14.1" y="501" width="0.2" height="15.0" fill="rgb(217,151,49)" rx="2" ry="2" />
+<text  x="17.05" y="511.5" ></text>
+</g>
+<g >
+<title>runtime.gcDrain (62 samples, 0.05%)</title><rect x="10.2" y="501" width="0.5" height="15.0" fill="rgb(227,0,11)" rx="2" ry="2" />
+<text  x="13.19" y="511.5" ></text>
+</g>
+<g >
+<title>crypto/tls.(*Conn).readRecordOrCCS (16 samples, 0.01%)</title><rect x="1183.8" y="357" width="0.2" height="15.0" fill="rgb(251,167,15)" rx="2" ry="2" />
+<text  x="1186.84" y="367.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/internal/common.ReadLinesOffsetN (31 samples, 0.02%)</title><rect x="1184.8" y="453" width="0.2" height="15.0" fill="rgb(213,94,6)" rx="2" ry="2" />
+<text  x="1187.76" y="463.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/process.(*Process).MemoryInfoWithContext (15 samples, 0.01%)</title><rect x="1185.1" y="469" width="0.2" height="15.0" fill="rgb(224,125,36)" rx="2" ry="2" />
+<text  x="1188.13" y="479.5" ></text>
+</g>
+<g >
+<title>runtime.mstart (82 samples, 0.06%)</title><rect x="1165.7" y="517" width="0.7" height="15.0" fill="rgb(215,44,9)" rx="2" ry="2" />
+<text  x="1168.68" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (466 samples, 0.34%)</title><rect x="1161.4" y="421" width="4.1" height="15.0" fill="rgb(253,131,12)" rx="2" ry="2" />
+<text  x="1164.40" y="431.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/diskmetrics.SizeFromDir (12 samples, 0.01%)</title><rect x="1182.2" y="517" width="0.1" height="15.0" fill="rgb(235,155,29)" rx="2" ry="2" />
+<text  x="1185.16" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (308 samples, 0.23%)</title><rect x="1162.8" y="357" width="2.7" height="15.0" fill="rgb(240,71,37)" rx="2" ry="2" />
+<text  x="1165.77" y="367.5" ></text>
+</g>
+<g >
+<title>ip6tables (12 samples, 0.01%)</title><rect x="19.5" y="581" width="0.1" height="15.0" fill="rgb(209,0,30)" rx="2" ry="2" />
+<text  x="22.48" y="591.5" ></text>
+</g>
+<g >
+<title>[unknown] (863 samples, 0.64%)</title><rect x="34.9" y="469" width="7.5" height="15.0" fill="rgb(242,12,17)" rx="2" ry="2" />
+<text  x="37.94" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="14.2" y="309" width="0.1" height="15.0" fill="rgb(235,90,10)" rx="2" ry="2" />
+<text  x="17.16" y="319.5" ></text>
+</g>
+<g >
+<title>[unknown] (128,988 samples, 95.11%)</title><rect x="43.1" y="501" width="1122.4" height="15.0" fill="rgb(252,163,36)" rx="2" ry="2" />
+<text  x="46.13" y="511.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.01%)</title><rect x="22.9" y="309" width="0.1" height="15.0" fill="rgb(245,180,5)" rx="2" ry="2" />
+<text  x="25.87" y="319.5" ></text>
+</g>
+<g >
+<title>[qemu-system-x86_64] (14 samples, 0.01%)</title><rect x="33.3" y="533" width="0.1" height="15.0" fill="rgb(222,36,50)" rx="2" ry="2" />
+<text  x="36.28" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="14.2" y="293" width="0.1" height="15.0" fill="rgb(220,165,31)" rx="2" ry="2" />
+<text  x="17.16" y="303.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/diff.(*compressedProcessor).Read (207 samples, 0.15%)</title><rect x="14.4" y="245" width="1.8" height="15.0" fill="rgb(231,228,4)" rx="2" ry="2" />
+<text  x="17.42" y="255.5" ></text>
+</g>
+<g >
+<title>internal/poll.(*FD).Write (27 samples, 0.02%)</title><rect x="1184.0" y="485" width="0.2" height="15.0" fill="rgb(252,32,40)" rx="2" ry="2" />
+<text  x="1186.99" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (432 samples, 0.32%)</title><rect x="28.1" y="453" width="3.8" height="15.0" fill="rgb(253,76,2)" rx="2" ry="2" />
+<text  x="31.12" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (27 samples, 0.02%)</title><rect x="1184.0" y="373" width="0.2" height="15.0" fill="rgb(221,87,22)" rx="2" ry="2" />
+<text  x="1186.99" y="383.5" ></text>
+</g>
+<g >
+<title>qemu-img (12 samples, 0.01%)</title><rect x="23.5" y="581" width="0.1" height="15.0" fill="rgb(244,48,22)" rx="2" ry="2" />
+<text  x="26.51" y="591.5" ></text>
+</g>
+<g >
+<title>[unknown] (104 samples, 0.08%)</title><rect x="1181.0" y="485" width="0.9" height="15.0" fill="rgb(247,112,9)" rx="2" ry="2" />
+<text  x="1184.02" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (244 samples, 0.18%)</title><rect x="1163.3" y="341" width="2.2" height="15.0" fill="rgb(240,111,49)" rx="2" ry="2" />
+<text  x="1166.33" y="351.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/vendor/google.golang.org/grpc.(*Server).processUnaryRPC (444 samples, 0.33%)</title><rect x="14.3" y="517" width="3.9" height="15.0" fill="rgb(231,212,0)" rx="2" ry="2" />
+<text  x="17.31" y="527.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/domainmgr.publishProcessMetric (47 samples, 0.03%)</title><rect x="1186.1" y="517" width="0.4" height="15.0" fill="rgb(239,28,14)" rx="2" ry="2" />
+<text  x="1189.08" y="527.5" ></text>
+</g>
+<g >
+<title>encoding/json.structEncoder.encode (15 samples, 0.01%)</title><rect x="1182.8" y="389" width="0.1" height="15.0" fill="rgb(234,105,7)" rx="2" ry="2" />
+<text  x="1185.81" y="399.5" ></text>
+</g>
+<g >
+<title>[unknown] (554 samples, 0.41%)</title><rect x="27.1" y="469" width="4.8" height="15.0" fill="rgb(220,134,14)" rx="2" ry="2" />
+<text  x="30.06" y="479.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).huffSym (50 samples, 0.04%)</title><rect x="15.0" y="165" width="0.4" height="15.0" fill="rgb(213,66,50)" rx="2" ry="2" />
+<text  x="17.99" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (92 samples, 0.07%)</title><rect x="19.8" y="565" width="0.8" height="15.0" fill="rgb(224,205,54)" rx="2" ry="2" />
+<text  x="22.76" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.01%)</title><rect x="24.3" y="325" width="0.1" height="15.0" fill="rgb(205,125,26)" rx="2" ry="2" />
+<text  x="27.31" y="335.5" ></text>
+</g>
+<g >
+<title>[unknown] (27 samples, 0.02%)</title><rect x="1184.0" y="405" width="0.2" height="15.0" fill="rgb(246,91,26)" rx="2" ry="2" />
+<text  x="1186.99" y="415.5" ></text>
+</g>
+<g >
+<title>encoding/json.(*encodeState).reflectValue (18 samples, 0.01%)</title><rect x="1182.5" y="485" width="0.2" height="15.0" fill="rgb(238,85,11)" rx="2" ry="2" />
+<text  x="1185.54" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (128,906 samples, 95.05%)</title><rect x="43.8" y="485" width="1121.7" height="15.0" fill="rgb(235,32,28)" rx="2" ry="2" />
+<text  x="46.85" y="495.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (979 samples, 0.72%)</title><rect x="1170.4" y="277" width="8.5" height="15.0" fill="rgb(224,54,18)" rx="2" ry="2" />
+<text  x="1173.41" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.notetsleep_internal (18 samples, 0.01%)</title><rect x="1165.7" y="453" width="0.2" height="15.0" fill="rgb(207,142,50)" rx="2" ry="2" />
+<text  x="1168.71" y="463.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive.openFile (26 samples, 0.02%)</title><rect x="16.5" y="325" width="0.2" height="15.0" fill="rgb(242,188,53)" rx="2" ry="2" />
+<text  x="19.52" y="335.5" ></text>
+</g>
+<g >
+<title>runtime.mstart1 (82 samples, 0.06%)</title><rect x="1165.7" y="501" width="0.7" height="15.0" fill="rgb(254,30,50)" rx="2" ry="2" />
+<text  x="1168.68" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (862 samples, 0.64%)</title><rect x="34.9" y="453" width="7.5" height="15.0" fill="rgb(214,10,20)" rx="2" ry="2" />
+<text  x="37.95" y="463.5" ></text>
+</g>
+<g >
+<title>runtime.bgscavenge.func1 (15 samples, 0.01%)</title><rect x="1188.2" y="405" width="0.2" height="15.0" fill="rgb(209,21,39)" rx="2" ry="2" />
+<text  x="1191.24" y="415.5" ></text>
+</g>
+<g >
+<title>crypto/tls.(*Conn).clientHandshake-fm (60 samples, 0.04%)</title><rect x="1187.5" y="517" width="0.6" height="15.0" fill="rgb(251,203,41)" rx="2" ry="2" />
+<text  x="1190.54" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (19 samples, 0.01%)</title><rect x="16.3" y="85" width="0.2" height="15.0" fill="rgb(251,182,26)" rx="2" ry="2" />
+<text  x="19.31" y="95.5" ></text>
+</g>
+<g >
+<title>runtime.gcBgMarkWorker.func2 (57 samples, 0.04%)</title><rect x="11.5" y="517" width="0.5" height="15.0" fill="rgb(248,200,52)" rx="2" ry="2" />
+<text  x="14.55" y="527.5" ></text>
+</g>
+<g >
+<title>[ld-musl-x86_64.so.1] (12 samples, 0.01%)</title><rect x="33.0" y="533" width="0.1" height="15.0" fill="rgb(251,83,29)" rx="2" ry="2" />
+<text  x="35.98" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (48 samples, 0.04%)</title><rect x="24.0" y="437" width="0.4" height="15.0" fill="rgb(219,151,23)" rx="2" ry="2" />
+<text  x="27.02" y="447.5" ></text>
+</g>
+<g >
+<title>runtime.markroot (60 samples, 0.04%)</title><rect x="1188.9" y="501" width="0.5" height="15.0" fill="rgb(253,88,16)" rx="2" ry="2" />
+<text  x="1191.85" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (211 samples, 0.16%)</title><rect x="1177.1" y="165" width="1.8" height="15.0" fill="rgb(236,148,49)" rx="2" ry="2" />
+<text  x="1180.09" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="16.4" y="53" width="0.1" height="15.0" fill="rgb(207,73,36)" rx="2" ry="2" />
+<text  x="19.37" y="63.5" ></text>
+</g>
+<g >
+<title>[unknown] (43 samples, 0.03%)</title><rect x="31.5" y="389" width="0.4" height="15.0" fill="rgb(227,136,5)" rx="2" ry="2" />
+<text  x="34.51" y="399.5" ></text>
+</g>
+<g >
+<title>[unknown] (24 samples, 0.02%)</title><rect x="20.4" y="389" width="0.2" height="15.0" fill="rgb(233,6,36)" rx="2" ry="2" />
+<text  x="23.35" y="399.5" ></text>
+</g>
+<g >
+<title>runtime.bgscavenge.func2 (13 samples, 0.01%)</title><rect x="1188.7" y="533" width="0.1" height="15.0" fill="rgb(246,72,39)" rx="2" ry="2" />
+<text  x="1191.72" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="14.2" y="277" width="0.1" height="15.0" fill="rgb(228,73,50)" rx="2" ry="2" />
+<text  x="17.16" y="287.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive.applyNaive (122 samples, 0.09%)</title><rect x="17.0" y="325" width="1.1" height="15.0" fill="rgb(226,105,27)" rx="2" ry="2" />
+<text  x="20.00" y="335.5" ></text>
+</g>
+<g >
+<title>runtime.gcDrain (131 samples, 0.10%)</title><rect x="1188.8" y="517" width="1.2" height="15.0" fill="rgb(210,67,27)" rx="2" ry="2" />
+<text  x="1191.83" y="527.5" ></text>
+</g>
+<g >
+<title>io.copyBuffer (44 samples, 0.03%)</title><rect x="1183.8" y="533" width="0.4" height="15.0" fill="rgb(254,156,15)" rx="2" ry="2" />
+<text  x="1186.84" y="543.5" ></text>
+</g>
+<g >
+<title>crypto/tls.(*clientHandshakeState).doFullHandshake (49 samples, 0.04%)</title><rect x="1187.6" y="469" width="0.4" height="15.0" fill="rgb(254,54,25)" rx="2" ry="2" />
+<text  x="1190.62" y="479.5" ></text>
+</g>
+<g >
+<title>crypto/sha256.block (69 samples, 0.05%)</title><rect x="1166.4" y="549" width="0.6" height="15.0" fill="rgb(246,96,54)" rx="2" ry="2" />
+<text  x="1169.39" y="559.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/process.(*Process).fillFromStatusWithContext (35 samples, 0.03%)</title><rect x="1185.3" y="469" width="0.3" height="15.0" fill="rgb(205,211,40)" rx="2" ry="2" />
+<text  x="1188.26" y="479.5" ></text>
+</g>
+<g >
+<title>runtime.scanstack (16 samples, 0.01%)</title><rect x="10.2" y="437" width="0.2" height="15.0" fill="rgb(242,56,9)" rx="2" ry="2" />
+<text  x="13.22" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (36 samples, 0.03%)</title><rect x="42.1" y="245" width="0.3" height="15.0" fill="rgb(217,35,14)" rx="2" ry="2" />
+<text  x="45.13" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (96 samples, 0.07%)</title><rect x="1178.1" y="101" width="0.8" height="15.0" fill="rgb(229,173,9)" rx="2" ry="2" />
+<text  x="1181.09" y="111.5" ></text>
+</g>
+<g >
+<title>[unknown] (59 samples, 0.04%)</title><rect x="1178.4" y="37" width="0.5" height="15.0" fill="rgb(209,44,38)" rx="2" ry="2" />
+<text  x="1181.41" y="47.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="1188.3" y="245" width="0.1" height="15.0" fill="rgb(234,196,28)" rx="2" ry="2" />
+<text  x="1191.25" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,244 samples, 0.92%)</title><rect x="1168.1" y="309" width="10.8" height="15.0" fill="rgb(245,208,49)" rx="2" ry="2" />
+<text  x="1171.10" y="319.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.02%)</title><rect x="16.2" y="229" width="0.3" height="15.0" fill="rgb(218,3,21)" rx="2" ry="2" />
+<text  x="19.25" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (144 samples, 0.11%)</title><rect x="1188.7" y="549" width="1.3" height="15.0" fill="rgb(218,227,14)" rx="2" ry="2" />
+<text  x="1191.72" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,217 samples, 0.90%)</title><rect x="1168.3" y="293" width="10.6" height="15.0" fill="rgb(224,175,30)" rx="2" ry="2" />
+<text  x="1171.33" y="303.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.02%)</title><rect x="22.8" y="533" width="0.2" height="15.0" fill="rgb(209,132,43)" rx="2" ry="2" />
+<text  x="25.76" y="543.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).huffSym (36 samples, 0.03%)</title><rect x="15.7" y="149" width="0.3" height="15.0" fill="rgb(247,123,42)" rx="2" ry="2" />
+<text  x="18.66" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (24 samples, 0.02%)</title><rect x="1166.2" y="389" width="0.2" height="15.0" fill="rgb(238,154,11)" rx="2" ry="2" />
+<text  x="1169.18" y="399.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="1188.3" y="213" width="0.1" height="15.0" fill="rgb(243,144,43)" rx="2" ry="2" />
+<text  x="1191.25" y="223.5" ></text>
+</g>
+<g >
+<title>crypto/x509.(*Certificate).buildChains (12 samples, 0.01%)</title><rect x="1187.6" y="421" width="0.1" height="15.0" fill="rgb(236,8,8)" rx="2" ry="2" />
+<text  x="1190.63" y="431.5" ></text>
+</g>
+<g >
+<title>runtime.selectnbsend (12 samples, 0.01%)</title><rect x="12.2" y="501" width="0.1" height="15.0" fill="rgb(215,190,33)" rx="2" ry="2" />
+<text  x="15.24" y="511.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/process.(*Process).MemoryPercentWithContext (58 samples, 0.04%)</title><rect x="1184.8" y="485" width="0.5" height="15.0" fill="rgb(221,143,40)" rx="2" ry="2" />
+<text  x="1187.75" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="20.4" y="293" width="0.2" height="15.0" fill="rgb(223,87,31)" rx="2" ry="2" />
+<text  x="23.45" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.gentraceback (19 samples, 0.01%)</title><rect x="1188.9" y="453" width="0.2" height="15.0" fill="rgb(249,191,0)" rx="2" ry="2" />
+<text  x="1191.89" y="463.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).huffSym (18 samples, 0.01%)</title><rect x="17.2" y="133" width="0.2" height="15.0" fill="rgb(224,86,15)" rx="2" ry="2" />
+<text  x="20.21" y="143.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/content/local.(*writer).Write (15 samples, 0.01%)</title><rect x="14.2" y="437" width="0.1" height="15.0" fill="rgb(230,77,25)" rx="2" ry="2" />
+<text  x="17.16" y="447.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive/compression.(*readCloserWrapper).Read (73 samples, 0.05%)</title><rect x="17.1" y="197" width="0.6" height="15.0" fill="rgb(222,14,18)" rx="2" ry="2" />
+<text  x="20.06" y="207.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="11.2" y="405" width="0.1" height="15.0" fill="rgb(252,104,38)" rx="2" ry="2" />
+<text  x="14.16" y="415.5" ></text>
+</g>
+<g >
+<title>runtime.schedule (38 samples, 0.03%)</title><rect x="1188.2" y="485" width="0.4" height="15.0" fill="rgb(228,211,29)" rx="2" ry="2" />
+<text  x="1191.23" y="495.5" ></text>
+</g>
+<g >
+<title>io.(*teeReader).Read (74 samples, 0.05%)</title><rect x="17.0" y="229" width="0.7" height="15.0" fill="rgb(252,203,1)" rx="2" ry="2" />
+<text  x="20.05" y="239.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/vendor/github.com/containerd/continuity/fs.walkLinks (12 samples, 0.01%)</title><rect x="16.8" y="309" width="0.1" height="15.0" fill="rgb(217,10,24)" rx="2" ry="2" />
+<text  x="19.84" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.startm (14 samples, 0.01%)</title><rect x="1188.2" y="341" width="0.2" height="15.0" fill="rgb(230,78,32)" rx="2" ry="2" />
+<text  x="1191.24" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (61 samples, 0.04%)</title><rect x="23.9" y="517" width="0.5" height="15.0" fill="rgb(239,137,41)" rx="2" ry="2" />
+<text  x="26.90" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (854 samples, 0.63%)</title><rect x="35.0" y="421" width="7.4" height="15.0" fill="rgb(225,104,9)" rx="2" ry="2" />
+<text  x="38.02" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="20.4" y="309" width="0.2" height="15.0" fill="rgb(226,55,14)" rx="2" ry="2" />
+<text  x="23.45" y="319.5" ></text>
+</g>
+<g >
+<title>[unknown] (301 samples, 0.22%)</title><rect x="39.8" y="357" width="2.6" height="15.0" fill="rgb(217,160,37)" rx="2" ry="2" />
+<text  x="42.83" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (63 samples, 0.05%)</title><rect x="23.9" y="549" width="0.5" height="15.0" fill="rgb(249,19,21)" rx="2" ry="2" />
+<text  x="26.89" y="559.5" ></text>
+</g>
+<g >
+<title>github.com/google/go-containerregistry/pkg/v1/v1util.(*verifyReader).Read (17 samples, 0.01%)</title><rect x="1183.8" y="501" width="0.2" height="15.0" fill="rgb(221,17,42)" rx="2" ry="2" />
+<text  x="1186.84" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (61 samples, 0.04%)</title><rect x="1181.4" y="341" width="0.5" height="15.0" fill="rgb(247,129,4)" rx="2" ry="2" />
+<text  x="1184.39" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (35 samples, 0.03%)</title><rect x="18.8" y="517" width="0.3" height="15.0" fill="rgb(215,85,47)" rx="2" ry="2" />
+<text  x="21.84" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="16.3" y="133" width="0.2" height="15.0" fill="rgb(248,222,21)" rx="2" ry="2" />
+<text  x="19.26" y="143.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/mount.WithTempMount (122 samples, 0.09%)</title><rect x="17.0" y="373" width="1.1" height="15.0" fill="rgb(224,103,10)" rx="2" ry="2" />
+<text  x="20.00" y="383.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="16.6" y="245" width="0.1" height="15.0" fill="rgb(221,116,42)" rx="2" ry="2" />
+<text  x="19.62" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (161 samples, 0.12%)</title><rect x="1165.7" y="565" width="1.4" height="15.0" fill="rgb(236,56,42)" rx="2" ry="2" />
+<text  x="1168.68" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,282 samples, 0.95%)</title><rect x="1167.8" y="389" width="11.1" height="15.0" fill="rgb(232,173,33)" rx="2" ry="2" />
+<text  x="1170.77" y="399.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/diskmetrics.SizeFromDir (12 samples, 0.01%)</title><rect x="1182.2" y="501" width="0.1" height="15.0" fill="rgb(241,141,25)" rx="2" ry="2" />
+<text  x="1185.16" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (128,997 samples, 95.12%)</title><rect x="43.1" y="533" width="1122.4" height="15.0" fill="rgb(242,4,17)" rx="2" ry="2" />
+<text  x="46.06" y="543.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (35 samples, 0.03%)</title><rect x="18.8" y="549" width="0.3" height="15.0" fill="rgb(226,43,2)" rx="2" ry="2" />
+<text  x="21.84" y="559.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/vendor/github.com/grpc-ecosystem/go-grpc-prometheus.(*ServerMetrics).UnaryServerInterceptor.func1 (431 samples, 0.32%)</title><rect x="14.3" y="485" width="3.8" height="15.0" fill="rgb(237,13,35)" rx="2" ry="2" />
+<text  x="17.32" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (103 samples, 0.08%)</title><rect x="1181.0" y="421" width="0.9" height="15.0" fill="rgb(230,47,54)" rx="2" ry="2" />
+<text  x="1184.03" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (17 samples, 0.01%)</title><rect x="23.0" y="565" width="0.1" height="15.0" fill="rgb(206,97,45)" rx="2" ry="2" />
+<text  x="26.00" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="16.6" y="213" width="0.1" height="15.0" fill="rgb(246,190,23)" rx="2" ry="2" />
+<text  x="19.62" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="16.3" y="149" width="0.2" height="15.0" fill="rgb(240,30,2)" rx="2" ry="2" />
+<text  x="19.26" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (238 samples, 0.18%)</title><rect x="40.4" y="341" width="2.0" height="15.0" fill="rgb(246,141,26)" rx="2" ry="2" />
+<text  x="43.38" y="351.5" ></text>
+</g>
+<g >
+<title>runtime.gcDrain (56 samples, 0.04%)</title><rect x="11.5" y="501" width="0.5" height="15.0" fill="rgb(230,204,51)" rx="2" ry="2" />
+<text  x="14.55" y="511.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/diff.(*compressedProcessor).Read (74 samples, 0.05%)</title><rect x="17.0" y="213" width="0.7" height="15.0" fill="rgb(243,108,17)" rx="2" ry="2" />
+<text  x="20.05" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.(*pageAlloc).scavenge (13 samples, 0.01%)</title><rect x="1188.7" y="517" width="0.1" height="15.0" fill="rgb(245,57,4)" rx="2" ry="2" />
+<text  x="1191.72" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (66 samples, 0.05%)</title><rect x="1181.4" y="357" width="0.5" height="15.0" fill="rgb(252,70,48)" rx="2" ry="2" />
+<text  x="1184.35" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (62 samples, 0.05%)</title><rect x="33.2" y="549" width="0.5" height="15.0" fill="rgb(223,40,39)" rx="2" ry="2" />
+<text  x="36.16" y="559.5" ></text>
+</g>
+<g >
+<title>encoding/json.(*encodeState).reflectValue (18 samples, 0.01%)</title><rect x="1182.8" y="421" width="0.1" height="15.0" fill="rgb(214,153,37)" rx="2" ry="2" />
+<text  x="1185.79" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="20.5" y="277" width="0.1" height="15.0" fill="rgb(244,148,18)" rx="2" ry="2" />
+<text  x="23.46" y="287.5" ></text>
+</g>
+<g >
+<title>[unknown] (24 samples, 0.02%)</title><rect x="1184.0" y="261" width="0.2" height="15.0" fill="rgb(254,94,49)" rx="2" ry="2" />
+<text  x="1187.01" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.gcBgMarkWorker.func2 (62 samples, 0.05%)</title><rect x="10.2" y="517" width="0.5" height="15.0" fill="rgb(252,67,34)" rx="2" ry="2" />
+<text  x="13.19" y="527.5" ></text>
+</g>
+<g >
+<title>runtime.markroot (13 samples, 0.01%)</title><rect x="11.6" y="485" width="0.1" height="15.0" fill="rgb(217,146,15)" rx="2" ry="2" />
+<text  x="14.57" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (48 samples, 0.04%)</title><rect x="34.2" y="453" width="0.4" height="15.0" fill="rgb(209,219,1)" rx="2" ry="2" />
+<text  x="37.16" y="463.5" ></text>
+</g>
+<g >
+<title>github.com/sirupsen/logrus.(*Entry).WithFields (20 samples, 0.01%)</title><rect x="1167.4" y="469" width="0.2" height="15.0" fill="rgb(213,215,54)" rx="2" ry="2" />
+<text  x="1170.41" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (18 samples, 0.01%)</title><rect x="22.8" y="389" width="0.2" height="15.0" fill="rgb(229,214,28)" rx="2" ry="2" />
+<text  x="25.83" y="399.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="11.4" y="437" width="0.1" height="15.0" fill="rgb(213,151,31)" rx="2" ry="2" />
+<text  x="14.44" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="1165.8" y="341" width="0.1" height="15.0" fill="rgb(221,223,1)" rx="2" ry="2" />
+<text  x="1168.75" y="351.5" ></text>
+</g>
+<g >
+<title>sem_post (57 samples, 0.04%)</title><rect x="34.1" y="549" width="0.5" height="15.0" fill="rgb(210,184,1)" rx="2" ry="2" />
+<text  x="37.08" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="1184.1" y="197" width="0.1" height="15.0" fill="rgb(250,60,5)" rx="2" ry="2" />
+<text  x="1187.11" y="207.5" ></text>
+</g>
+<g >
+<title>runtime.stopm (12 samples, 0.01%)</title><rect x="13.7" y="453" width="0.1" height="15.0" fill="rgb(227,48,0)" rx="2" ry="2" />
+<text  x="16.70" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="22.8" y="501" width="0.2" height="15.0" fill="rgb(242,113,8)" rx="2" ry="2" />
+<text  x="25.77" y="511.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/zedUpload/ociutil.PullBlob.func1 (44 samples, 0.03%)</title><rect x="1183.8" y="549" width="0.4" height="15.0" fill="rgb(223,26,37)" rx="2" ry="2" />
+<text  x="1186.84" y="559.5" ></text>
+</g>
+<g >
+<title>runtime.runtimer (17 samples, 0.01%)</title><rect x="1188.2" y="437" width="0.2" height="15.0" fill="rgb(220,36,10)" rx="2" ry="2" />
+<text  x="1191.23" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="22.8" y="485" width="0.2" height="15.0" fill="rgb(253,12,11)" rx="2" ry="2" />
+<text  x="25.77" y="495.5" ></text>
+</g>
+<g >
+<title>internal/poll.(*FD).Write (29 samples, 0.02%)</title><rect x="16.2" y="293" width="0.3" height="15.0" fill="rgb(248,63,29)" rx="2" ry="2" />
+<text  x="19.22" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.scanblock (31 samples, 0.02%)</title><rect x="1189.1" y="469" width="0.3" height="15.0" fill="rgb(247,75,10)" rx="2" ry="2" />
+<text  x="1192.10" y="479.5" ></text>
+</g>
+<g >
+<title>os.openFileNolog (12 samples, 0.01%)</title><rect x="16.5" y="293" width="0.1" height="15.0" fill="rgb(233,37,28)" rx="2" ry="2" />
+<text  x="19.52" y="303.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="1165.7" y="421" width="0.2" height="15.0" fill="rgb(229,104,6)" rx="2" ry="2" />
+<text  x="1168.73" y="431.5" ></text>
+</g>
+<g >
+<title>dnsmasq (107 samples, 0.08%)</title><rect x="18.3" y="581" width="0.9" height="15.0" fill="rgb(222,116,1)" rx="2" ry="2" />
+<text  x="21.27" y="591.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.02%)</title><rect x="1165.2" y="213" width="0.3" height="15.0" fill="rgb(240,1,28)" rx="2" ry="2" />
+<text  x="1168.23" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.01%)</title><rect x="1165.7" y="357" width="0.2" height="15.0" fill="rgb(217,11,39)" rx="2" ry="2" />
+<text  x="1168.74" y="367.5" ></text>
+</g>
+<g >
+<title>compress/gzip.(*Reader).Read (73 samples, 0.05%)</title><rect x="17.1" y="181" width="0.6" height="15.0" fill="rgb(236,109,3)" rx="2" ry="2" />
+<text  x="20.06" y="191.5" ></text>
+</g>
+<g >
+<title>archive/tar.(*regFileReader).Read (74 samples, 0.05%)</title><rect x="17.0" y="261" width="0.7" height="15.0" fill="rgb(236,109,19)" rx="2" ry="2" />
+<text  x="20.05" y="271.5" ></text>
+</g>
+<g >
+<title>time.sendTime (12 samples, 0.01%)</title><rect x="12.2" y="517" width="0.1" height="15.0" fill="rgb(241,17,3)" rx="2" ry="2" />
+<text  x="15.24" y="527.5" ></text>
+</g>
+<g >
+<title>compress/gzip.(*Reader).Read (207 samples, 0.15%)</title><rect x="14.4" y="213" width="1.8" height="15.0" fill="rgb(251,59,42)" rx="2" ry="2" />
+<text  x="17.42" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (48 samples, 0.04%)</title><rect x="34.2" y="469" width="0.4" height="15.0" fill="rgb(247,33,22)" rx="2" ry="2" />
+<text  x="37.16" y="479.5" ></text>
+</g>
+<g >
+<title>crypto/tls.(*clientHandshakeState).handshake (53 samples, 0.04%)</title><rect x="1187.6" y="485" width="0.5" height="15.0" fill="rgb(252,140,41)" rx="2" ry="2" />
+<text  x="1190.60" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (207 samples, 0.15%)</title><rect x="1179.2" y="389" width="1.8" height="15.0" fill="rgb(249,211,40)" rx="2" ry="2" />
+<text  x="1182.18" y="399.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).nextBlock (29 samples, 0.02%)</title><rect x="17.4" y="149" width="0.2" height="15.0" fill="rgb(236,11,48)" rx="2" ry="2" />
+<text  x="20.39" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (36 samples, 0.03%)</title><rect x="1165.1" y="245" width="0.4" height="15.0" fill="rgb(235,221,2)" rx="2" ry="2" />
+<text  x="1168.14" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="23.0" y="357" width="0.1" height="15.0" fill="rgb(219,164,30)" rx="2" ry="2" />
+<text  x="26.03" y="367.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).huffSym (12 samples, 0.01%)</title><rect x="17.5" y="117" width="0.1" height="15.0" fill="rgb(225,178,15)" rx="2" ry="2" />
+<text  x="20.52" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="23.0" y="421" width="0.1" height="15.0" fill="rgb(207,10,17)" rx="2" ry="2" />
+<text  x="26.02" y="431.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/diff/apply.apply (431 samples, 0.32%)</title><rect x="14.3" y="389" width="3.8" height="15.0" fill="rgb(230,130,2)" rx="2" ry="2" />
+<text  x="17.32" y="399.5" ></text>
+</g>
+<g >
+<title>[unknown] (60 samples, 0.04%)</title><rect x="23.9" y="485" width="0.5" height="15.0" fill="rgb(225,94,47)" rx="2" ry="2" />
+<text  x="26.91" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (40 samples, 0.03%)</title><rect x="1165.1" y="261" width="0.4" height="15.0" fill="rgb(213,68,22)" rx="2" ry="2" />
+<text  x="1168.11" y="271.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive.createTarFile (111 samples, 0.08%)</title><rect x="17.0" y="309" width="1.0" height="15.0" fill="rgb(210,62,19)" rx="2" ry="2" />
+<text  x="20.04" y="319.5" ></text>
+</g>
+<g >
+<title>os.(*File).Write (15 samples, 0.01%)</title><rect x="14.2" y="421" width="0.1" height="15.0" fill="rgb(217,30,11)" rx="2" ry="2" />
+<text  x="17.16" y="431.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/diskmetrics.SizeFromDir (12 samples, 0.01%)</title><rect x="1182.2" y="485" width="0.1" height="15.0" fill="rgb(228,46,38)" rx="2" ry="2" />
+<text  x="1185.16" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="1165.7" y="373" width="0.2" height="15.0" fill="rgb(241,198,21)" rx="2" ry="2" />
+<text  x="1168.73" y="383.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/base.(*LockedStringMap).Range (84 samples, 0.06%)</title><rect x="1182.8" y="501" width="0.7" height="15.0" fill="rgb(235,90,8)" rx="2" ry="2" />
+<text  x="1185.79" y="511.5" ></text>
+</g>
+<g >
+<title>syscall.Syscall (29 samples, 0.02%)</title><rect x="16.2" y="277" width="0.3" height="15.0" fill="rgb(236,180,1)" rx="2" ry="2" />
+<text  x="19.22" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.injectglist (14 samples, 0.01%)</title><rect x="1188.2" y="373" width="0.2" height="15.0" fill="rgb(209,159,0)" rx="2" ry="2" />
+<text  x="1191.24" y="383.5" ></text>
+</g>
+<g >
+<title>syscall.Fchmodat (13 samples, 0.01%)</title><rect x="16.6" y="293" width="0.1" height="15.0" fill="rgb(211,100,16)" rx="2" ry="2" />
+<text  x="19.62" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.markrootBlock (33 samples, 0.02%)</title><rect x="1189.1" y="485" width="0.3" height="15.0" fill="rgb(243,148,22)" rx="2" ry="2" />
+<text  x="1192.09" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="23.0" y="405" width="0.1" height="15.0" fill="rgb(248,142,11)" rx="2" ry="2" />
+<text  x="26.02" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (23 samples, 0.02%)</title><rect x="1165.3" y="197" width="0.2" height="15.0" fill="rgb(248,12,52)" rx="2" ry="2" />
+<text  x="1168.25" y="207.5" ></text>
+</g>
+<g >
+<title>jq (205 samples, 0.15%)</title><rect x="20.6" y="581" width="1.7" height="15.0" fill="rgb(211,1,40)" rx="2" ry="2" />
+<text  x="23.56" y="591.5" ></text>
+</g>
+<g >
+<title>io/ioutil.readAll (12 samples, 0.01%)</title><rect x="1185.3" y="437" width="0.1" height="15.0" fill="rgb(208,115,50)" rx="2" ry="2" />
+<text  x="1188.30" y="447.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).huffmanBlock (105 samples, 0.08%)</title><rect x="14.5" y="181" width="0.9" height="15.0" fill="rgb(223,125,35)" rx="2" ry="2" />
+<text  x="17.53" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="1165.7" y="405" width="0.2" height="15.0" fill="rgb(240,8,19)" rx="2" ry="2" />
+<text  x="1168.73" y="415.5" ></text>
+</g>
+<g >
+<title>runtime.markroot.func1 (26 samples, 0.02%)</title><rect x="1188.9" y="485" width="0.2" height="15.0" fill="rgb(236,46,30)" rx="2" ry="2" />
+<text  x="1191.86" y="495.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive.openFile (17 samples, 0.01%)</title><rect x="17.8" y="293" width="0.2" height="15.0" fill="rgb(249,221,29)" rx="2" ry="2" />
+<text  x="20.80" y="303.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/volumemgr.casIngestWorker (12 samples, 0.01%)</title><rect x="1183.7" y="533" width="0.1" height="15.0" fill="rgb(225,118,17)" rx="2" ry="2" />
+<text  x="1186.66" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (82 samples, 0.06%)</title><rect x="10.1" y="565" width="0.7" height="15.0" fill="rgb(235,135,25)" rx="2" ry="2" />
+<text  x="13.05" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (75 samples, 0.06%)</title><rect x="19.9" y="469" width="0.7" height="15.0" fill="rgb(215,74,49)" rx="2" ry="2" />
+<text  x="22.91" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="1180.9" y="325" width="0.1" height="15.0" fill="rgb(222,123,31)" rx="2" ry="2" />
+<text  x="1183.87" y="335.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="23.0" y="373" width="0.1" height="15.0" fill="rgb(207,82,27)" rx="2" ry="2" />
+<text  x="26.02" y="383.5" ></text>
+</g>
+<g >
+<title>runtime.notesleep (12 samples, 0.01%)</title><rect x="1188.4" y="437" width="0.1" height="15.0" fill="rgb(216,157,40)" rx="2" ry="2" />
+<text  x="1191.43" y="447.5" ></text>
+</g>
+<g >
+<title>os.(*File).Write (29 samples, 0.02%)</title><rect x="16.2" y="309" width="0.3" height="15.0" fill="rgb(215,22,14)" rx="2" ry="2" />
+<text  x="19.22" y="319.5" ></text>
+</g>
+<g >
+<title>[jq] (123 samples, 0.09%)</title><rect x="20.6" y="565" width="1.0" height="15.0" fill="rgb(238,132,53)" rx="2" ry="2" />
+<text  x="23.56" y="575.5" ></text>
+</g>
+<g >
+<title>syscall.Syscall (1,301 samples, 0.96%)</title><rect x="1167.7" y="437" width="11.3" height="15.0" fill="rgb(239,173,41)" rx="2" ry="2" />
+<text  x="1170.71" y="447.5" ></text>
+</g>
+<g >
+<title>qemu-system-x86 (2,192 samples, 1.62%)</title><rect x="23.6" y="581" width="19.1" height="15.0" fill="rgb(247,203,31)" rx="2" ry="2" />
+<text  x="26.62" y="591.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="1184.1" y="213" width="0.1" height="15.0" fill="rgb(239,217,0)" rx="2" ry="2" />
+<text  x="1187.09" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="22.9" y="325" width="0.1" height="15.0" fill="rgb(207,65,25)" rx="2" ry="2" />
+<text  x="25.85" y="335.5" ></text>
+</g>
+<g >
+<title>runtime.exitsyscallfast_pidle (13 samples, 0.01%)</title><rect x="12.1" y="453" width="0.1" height="15.0" fill="rgb(219,176,5)" rx="2" ry="2" />
+<text  x="15.09" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="14.2" y="325" width="0.1" height="15.0" fill="rgb(241,199,27)" rx="2" ry="2" />
+<text  x="17.16" y="335.5" ></text>
+</g>
+<g >
+<title>[unknown] (21 samples, 0.02%)</title><rect x="1165.3" y="181" width="0.2" height="15.0" fill="rgb(240,43,53)" rx="2" ry="2" />
+<text  x="1168.27" y="191.5" ></text>
+</g>
+<g >
+<title>rs:main_Q:Reg (15 samples, 0.01%)</title><rect x="42.8" y="581" width="0.1" height="15.0" fill="rgb(228,25,45)" rx="2" ry="2" />
+<text  x="45.78" y="591.5" ></text>
+</g>
+<g >
+<title>[unknown] (55 samples, 0.04%)</title><rect x="20.1" y="453" width="0.5" height="15.0" fill="rgb(244,63,4)" rx="2" ry="2" />
+<text  x="23.08" y="463.5" ></text>
+</g>
+<g >
+<title>crypto/tls.(*ecdheKeyAgreement).processServerKeyExchange (19 samples, 0.01%)</title><rect x="1187.9" y="453" width="0.1" height="15.0" fill="rgb(245,75,50)" rx="2" ry="2" />
+<text  x="1190.87" y="463.5" ></text>
+</g>
+<g >
+<title>runtime.notewakeup (14 samples, 0.01%)</title><rect x="1188.2" y="325" width="0.2" height="15.0" fill="rgb(224,17,12)" rx="2" ry="2" />
+<text  x="1191.24" y="335.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/zedagent.configTimerTask (13 samples, 0.01%)</title><rect x="1182.3" y="549" width="0.1" height="15.0" fill="rgb(248,98,43)" rx="2" ry="2" />
+<text  x="1185.27" y="559.5" ></text>
+</g>
+<g >
+<title>runtime.schedule (21 samples, 0.02%)</title><rect x="13.7" y="485" width="0.1" height="15.0" fill="rgb(228,56,52)" rx="2" ry="2" />
+<text  x="16.66" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (19 samples, 0.01%)</title><rect x="1184.1" y="245" width="0.1" height="15.0" fill="rgb(247,67,23)" rx="2" ry="2" />
+<text  x="1187.06" y="255.5" ></text>
+</g>
+<g >
+<title>[libglib-2.0.so.0.6400.6] (50 samples, 0.04%)</title><rect x="31.9" y="549" width="0.4" height="15.0" fill="rgb(223,51,31)" rx="2" ry="2" />
+<text  x="34.88" y="559.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/mem.VirtualMemoryWithContext (43 samples, 0.03%)</title><rect x="1184.8" y="469" width="0.3" height="15.0" fill="rgb(224,141,37)" rx="2" ry="2" />
+<text  x="1187.75" y="479.5" ></text>
+</g>
+<g >
+<title>encoding/json.(*decodeState).unmarshal (39 samples, 0.03%)</title><rect x="1183.0" y="437" width="0.3" height="15.0" fill="rgb(213,16,23)" rx="2" ry="2" />
+<text  x="1185.97" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (60 samples, 0.04%)</title><rect x="23.9" y="501" width="0.5" height="15.0" fill="rgb(209,3,38)" rx="2" ry="2" />
+<text  x="26.91" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (216 samples, 0.16%)</title><rect x="1179.1" y="469" width="1.9" height="15.0" fill="rgb(217,168,54)" rx="2" ry="2" />
+<text  x="1182.11" y="479.5" ></text>
+</g>
+<g >
+<title>runtime.scanobject (34 samples, 0.03%)</title><rect x="10.4" y="485" width="0.3" height="15.0" fill="rgb(214,210,53)" rx="2" ry="2" />
+<text  x="13.44" y="495.5" ></text>
+</g>
+<g >
+<title>[ld-musl-x86_64.so.1] (94 samples, 0.07%)</title><rect x="23.6" y="565" width="0.8" height="15.0" fill="rgb(231,171,2)" rx="2" ry="2" />
+<text  x="26.62" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (97 samples, 0.07%)</title><rect x="1181.1" y="405" width="0.8" height="15.0" fill="rgb(224,209,43)" rx="2" ry="2" />
+<text  x="1184.08" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,268 samples, 0.93%)</title><rect x="1167.9" y="325" width="11.0" height="15.0" fill="rgb(225,28,52)" rx="2" ry="2" />
+<text  x="1170.89" y="335.5" ></text>
+</g>
+<g >
+<title>crypto/tls.(*Conn).verifyServerCertificate (26 samples, 0.02%)</title><rect x="1187.6" y="453" width="0.3" height="15.0" fill="rgb(236,165,11)" rx="2" ry="2" />
+<text  x="1190.63" y="463.5" ></text>
+</g>
+<g >
+<title>runtime.notetsleepg (19 samples, 0.01%)</title><rect x="12.1" y="517" width="0.1" height="15.0" fill="rgb(233,63,26)" rx="2" ry="2" />
+<text  x="15.07" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="16.6" y="261" width="0.1" height="15.0" fill="rgb(221,189,21)" rx="2" ry="2" />
+<text  x="19.62" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (20 samples, 0.01%)</title><rect x="22.8" y="437" width="0.2" height="15.0" fill="rgb(212,129,13)" rx="2" ry="2" />
+<text  x="25.82" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="1165.4" y="117" width="0.1" height="15.0" fill="rgb(206,140,8)" rx="2" ry="2" />
+<text  x="1168.35" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (75 samples, 0.06%)</title><rect x="1181.3" y="373" width="0.6" height="15.0" fill="rgb(205,139,27)" rx="2" ry="2" />
+<text  x="1184.27" y="383.5" ></text>
+</g>
+<g >
+<title>encoding/json.(*encodeState).marshal (18 samples, 0.01%)</title><rect x="1182.8" y="437" width="0.1" height="15.0" fill="rgb(218,82,24)" rx="2" ry="2" />
+<text  x="1185.79" y="447.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/domainmgr.gatherProcessMetricList (195 samples, 0.14%)</title><rect x="1184.4" y="517" width="1.7" height="15.0" fill="rgb(240,119,9)" rx="2" ry="2" />
+<text  x="1187.38" y="527.5" ></text>
+</g>
+<g >
+<title>runtime.(*pageAlloc).scavengeOne (13 samples, 0.01%)</title><rect x="1188.7" y="501" width="0.1" height="15.0" fill="rgb(207,172,48)" rx="2" ry="2" />
+<text  x="1191.72" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="11.4" y="485" width="0.1" height="15.0" fill="rgb(245,20,8)" rx="2" ry="2" />
+<text  x="14.42" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="16.6" y="197" width="0.1" height="15.0" fill="rgb(219,0,42)" rx="2" ry="2" />
+<text  x="19.62" y="207.5" ></text>
+</g>
+<g >
+<title>runtime.wakeScavenger (15 samples, 0.01%)</title><rect x="1188.2" y="389" width="0.2" height="15.0" fill="rgb(205,201,0)" rx="2" ry="2" />
+<text  x="1191.24" y="399.5" ></text>
+</g>
+<g >
+<title>[unknown] (804 samples, 0.59%)</title><rect x="35.5" y="405" width="6.9" height="15.0" fill="rgb(205,183,38)" rx="2" ry="2" />
+<text  x="38.45" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (213 samples, 0.16%)</title><rect x="1179.1" y="437" width="1.9" height="15.0" fill="rgb(207,55,40)" rx="2" ry="2" />
+<text  x="1182.13" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="11.4" y="501" width="0.1" height="15.0" fill="rgb(224,216,53)" rx="2" ry="2" />
+<text  x="14.42" y="511.5" ></text>
+</g>
+<g >
+<title>crypto/rsa.encrypt (13 samples, 0.01%)</title><rect x="1187.9" y="405" width="0.1" height="15.0" fill="rgb(243,130,10)" rx="2" ry="2" />
+<text  x="1190.91" y="415.5" ></text>
+</g>
+<g >
+<title>encoding/json.checkValid (14 samples, 0.01%)</title><rect x="1183.3" y="437" width="0.1" height="15.0" fill="rgb(228,91,24)" rx="2" ry="2" />
+<text  x="1186.31" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (148 samples, 0.11%)</title><rect x="1177.6" y="149" width="1.3" height="15.0" fill="rgb(219,101,19)" rx="2" ry="2" />
+<text  x="1180.64" y="159.5" ></text>
+</g>
+<g >
+<title>github.com/shirou/gopsutil/process.(*Process).NameWithContext (35 samples, 0.03%)</title><rect x="1185.3" y="485" width="0.3" height="15.0" fill="rgb(231,228,47)" rx="2" ry="2" />
+<text  x="1188.26" y="495.5" ></text>
+</g>
+<g >
+<title>swapper (128,997 samples, 95.12%)</title><rect x="43.1" y="581" width="1122.4" height="15.0" fill="rgb(221,214,20)" rx="2" ry="2" />
+<text  x="46.06" y="591.5" >swapper</text>
+</g>
+<g >
+<title>github.com/containerd/containerd/vendor/github.com/containerd/continuity/fs.RootPath (15 samples, 0.01%)</title><rect x="16.8" y="341" width="0.2" height="15.0" fill="rgb(215,42,39)" rx="2" ry="2" />
+<text  x="19.84" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (108 samples, 0.08%)</title><rect x="1178.0" y="133" width="0.9" height="15.0" fill="rgb(225,220,14)" rx="2" ry="2" />
+<text  x="1180.98" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.02%)</title><rect x="22.8" y="517" width="0.2" height="15.0" fill="rgb(235,54,12)" rx="2" ry="2" />
+<text  x="25.76" y="527.5" ></text>
+</g>
+<g >
+<title>encoding/json.structEncoder.encode-fm (16 samples, 0.01%)</title><rect x="1182.8" y="405" width="0.1" height="15.0" fill="rgb(234,84,33)" rx="2" ry="2" />
+<text  x="1185.80" y="415.5" ></text>
+</g>
+<g >
+<title>net/http.(*body).readLocked (17 samples, 0.01%)</title><rect x="1183.8" y="437" width="0.2" height="15.0" fill="rgb(227,74,6)" rx="2" ry="2" />
+<text  x="1186.84" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (587 samples, 0.43%)</title><rect x="37.3" y="373" width="5.1" height="15.0" fill="rgb(247,13,52)" rx="2" ry="2" />
+<text  x="40.34" y="383.5" ></text>
+</g>
+<g >
+<title>[unknown] (216 samples, 0.16%)</title><rect x="1179.1" y="453" width="1.9" height="15.0" fill="rgb(239,70,15)" rx="2" ry="2" />
+<text  x="1182.11" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="11.1" y="421" width="0.2" height="15.0" fill="rgb(211,210,25)" rx="2" ry="2" />
+<text  x="14.13" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="16.6" y="181" width="0.1" height="15.0" fill="rgb(254,198,49)" rx="2" ry="2" />
+<text  x="19.62" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.02%)</title><rect x="22.8" y="549" width="0.2" height="15.0" fill="rgb(207,21,31)" rx="2" ry="2" />
+<text  x="25.76" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (79 samples, 0.06%)</title><rect x="1178.2" y="53" width="0.7" height="15.0" fill="rgb(222,163,44)" rx="2" ry="2" />
+<text  x="1181.24" y="63.5" ></text>
+</g>
+<g >
+<title>encoding/json.structEncoder.encode (18 samples, 0.01%)</title><rect x="1182.5" y="453" width="0.2" height="15.0" fill="rgb(216,167,42)" rx="2" ry="2" />
+<text  x="1185.54" y="463.5" ></text>
+</g>
+<g >
+<title>runtime.stopm (14 samples, 0.01%)</title><rect x="1188.4" y="453" width="0.1" height="15.0" fill="rgb(225,42,22)" rx="2" ry="2" />
+<text  x="1191.43" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (82 samples, 0.06%)</title><rect x="1165.7" y="549" width="0.7" height="15.0" fill="rgb(219,19,2)" rx="2" ry="2" />
+<text  x="1168.68" y="559.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/cmd/ledmanager.uncachedDiskRead (1,675 samples, 1.24%)</title><rect x="1167.4" y="517" width="14.6" height="15.0" fill="rgb(227,190,52)" rx="2" ry="2" />
+<text  x="1170.38" y="527.5" ></text>
+</g>
+<g >
+<title>io/ioutil.ReadFile (14 samples, 0.01%)</title><rect x="1185.7" y="453" width="0.2" height="15.0" fill="rgb(249,137,16)" rx="2" ry="2" />
+<text  x="1188.75" y="463.5" ></text>
+</g>
+<g >
+<title>all (135,617 samples, 100%)</title><rect x="10.0" y="597" width="1180.0" height="15.0" fill="rgb(205,56,38)" rx="2" ry="2" />
+<text  x="13.00" y="607.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/archive.createTarFile (276 samples, 0.20%)</title><rect x="14.4" y="341" width="2.4" height="15.0" fill="rgb(248,185,50)" rx="2" ry="2" />
+<text  x="17.41" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.01%)</title><rect x="1188.3" y="197" width="0.1" height="15.0" fill="rgb(207,224,51)" rx="2" ry="2" />
+<text  x="1191.25" y="207.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/metadata.(*namespacedWriter).Write (15 samples, 0.01%)</title><rect x="14.2" y="453" width="0.1" height="15.0" fill="rgb(250,137,18)" rx="2" ry="2" />
+<text  x="17.16" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (89 samples, 0.07%)</title><rect x="1178.1" y="85" width="0.8" height="15.0" fill="rgb(210,185,39)" rx="2" ry="2" />
+<text  x="1181.15" y="95.5" ></text>
+</g>
+<g >
+<title>[unknown] (40 samples, 0.03%)</title><rect x="42.1" y="261" width="0.3" height="15.0" fill="rgb(207,42,21)" rx="2" ry="2" />
+<text  x="45.10" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.exitsyscall (12 samples, 0.01%)</title><rect x="1178.9" y="421" width="0.1" height="15.0" fill="rgb(223,50,21)" rx="2" ry="2" />
+<text  x="1181.92" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (61 samples, 0.04%)</title><rect x="23.9" y="533" width="0.5" height="15.0" fill="rgb(247,213,42)" rx="2" ry="2" />
+<text  x="26.90" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.01%)</title><rect x="1188.2" y="261" width="0.2" height="15.0" fill="rgb(210,53,45)" rx="2" ry="2" />
+<text  x="1191.24" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="16.3" y="165" width="0.2" height="15.0" fill="rgb(223,215,14)" rx="2" ry="2" />
+<text  x="19.26" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="23.0" y="469" width="0.1" height="15.0" fill="rgb(246,132,27)" rx="2" ry="2" />
+<text  x="26.01" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (665 samples, 0.49%)</title><rect x="1173.1" y="229" width="5.8" height="15.0" fill="rgb(242,180,40)" rx="2" ry="2" />
+<text  x="1176.14" y="239.5" ></text>
+</g>
+<g >
+<title>crypto/tls.(*Conn).clientHandshake (60 samples, 0.04%)</title><rect x="1187.5" y="501" width="0.6" height="15.0" fill="rgb(208,165,30)" rx="2" ry="2" />
+<text  x="1190.54" y="511.5" ></text>
+</g>
+<g >
+<title>runtime.mcall (21 samples, 0.02%)</title><rect x="13.7" y="517" width="0.1" height="15.0" fill="rgb(208,194,39)" rx="2" ry="2" />
+<text  x="16.66" y="527.5" ></text>
+</g>
+<g >
+<title>os.(*File).Read (1,306 samples, 0.96%)</title><rect x="1167.7" y="501" width="11.3" height="15.0" fill="rgb(209,108,49)" rx="2" ry="2" />
+<text  x="1170.67" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (128,996 samples, 95.12%)</title><rect x="43.1" y="517" width="1122.4" height="15.0" fill="rgb(240,184,21)" rx="2" ry="2" />
+<text  x="46.06" y="527.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (35 samples, 0.03%)</title><rect x="18.8" y="533" width="0.3" height="15.0" fill="rgb(235,202,36)" rx="2" ry="2" />
+<text  x="21.84" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (128,997 samples, 95.12%)</title><rect x="43.1" y="549" width="1122.4" height="15.0" fill="rgb(214,127,25)" rx="2" ry="2" />
+<text  x="46.06" y="559.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (16 samples, 0.01%)</title><rect x="23.0" y="453" width="0.1" height="15.0" fill="rgb(215,67,43)" rx="2" ry="2" />
+<text  x="26.01" y="463.5" ></text>
+</g>
+<g >
+<title>[jq] (62 samples, 0.05%)</title><rect x="21.7" y="549" width="0.5" height="15.0" fill="rgb(254,155,15)" rx="2" ry="2" />
+<text  x="24.67" y="559.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (13 samples, 0.01%)</title><rect x="12.1" y="485" width="0.1" height="15.0" fill="rgb(224,228,47)" rx="2" ry="2" />
+<text  x="15.09" y="495.5" ></text>
+</g>
+<g >
+<title>encoding/json.(*decodeState).value (24 samples, 0.02%)</title><rect x="1183.0" y="389" width="0.2" height="15.0" fill="rgb(242,104,27)" rx="2" ry="2" />
+<text  x="1186.00" y="399.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.01%)</title><rect x="1188.3" y="181" width="0.1" height="15.0" fill="rgb(208,191,30)" rx="2" ry="2" />
+<text  x="1191.26" y="191.5" ></text>
+</g>
+<g >
+<title>io/ioutil.ReadFile (12 samples, 0.01%)</title><rect x="1185.1" y="437" width="0.1" height="15.0" fill="rgb(212,84,9)" rx="2" ry="2" />
+<text  x="1188.14" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (24 samples, 0.02%)</title><rect x="16.3" y="101" width="0.2" height="15.0" fill="rgb(235,97,10)" rx="2" ry="2" />
+<text  x="19.26" y="111.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).huffSym (13 samples, 0.01%)</title><rect x="14.4" y="181" width="0.1" height="15.0" fill="rgb(213,49,9)" rx="2" ry="2" />
+<text  x="17.42" y="191.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/services/diff.(*local).Apply (431 samples, 0.32%)</title><rect x="14.3" y="437" width="3.8" height="15.0" fill="rgb(208,40,6)" rx="2" ry="2" />
+<text  x="17.32" y="447.5" ></text>
+</g>
+<g >
+<title>compress/flate.(*decompressor).huffmanBlock (36 samples, 0.03%)</title><rect x="17.1" y="149" width="0.3" height="15.0" fill="rgb(248,173,16)" rx="2" ry="2" />
+<text  x="20.07" y="159.5" ></text>
+</g>
+<g >
+<title>runtime.exitsyscall (14 samples, 0.01%)</title><rect x="12.1" y="501" width="0.1" height="15.0" fill="rgb(234,53,35)" rx="2" ry="2" />
+<text  x="15.08" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (15 samples, 0.01%)</title><rect x="20.4" y="325" width="0.2" height="15.0" fill="rgb(207,182,8)" rx="2" ry="2" />
+<text  x="23.43" y="335.5" ></text>
+</g>
+<g >
+<title>[qemu-system-x86_64] (40 samples, 0.03%)</title><rect x="24.5" y="565" width="0.3" height="15.0" fill="rgb(208,177,41)" rx="2" ry="2" />
+<text  x="27.50" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.01%)</title><rect x="14.2" y="229" width="0.1" height="15.0" fill="rgb(242,207,16)" rx="2" ry="2" />
+<text  x="17.17" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.park_m (38 samples, 0.03%)</title><rect x="1188.2" y="501" width="0.4" height="15.0" fill="rgb(232,17,32)" rx="2" ry="2" />
+<text  x="1191.23" y="511.5" ></text>
+</g>
+<g >
+<title>[unknown] (46 samples, 0.03%)</title><rect x="20.2" y="437" width="0.4" height="15.0" fill="rgb(244,65,17)" rx="2" ry="2" />
+<text  x="23.16" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (229 samples, 0.17%)</title><rect x="29.9" y="437" width="2.0" height="15.0" fill="rgb(239,149,7)" rx="2" ry="2" />
+<text  x="32.89" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (27 samples, 0.02%)</title><rect x="1184.0" y="421" width="0.2" height="15.0" fill="rgb(243,122,20)" rx="2" ry="2" />
+<text  x="1186.99" y="431.5" ></text>
+</g>
+<g >
+<title>containerd-shim (97 samples, 0.07%)</title><rect x="10.1" y="581" width="0.8" height="15.0" fill="rgb(214,164,53)" rx="2" ry="2" />
+<text  x="13.05" y="591.5" ></text>
+</g>
+<g >
+<title>bufio.(*Reader).ReadString (14 samples, 0.01%)</title><rect x="1184.8" y="437" width="0.1" height="15.0" fill="rgb(218,151,12)" rx="2" ry="2" />
+<text  x="1187.76" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (27 samples, 0.02%)</title><rect x="1184.0" y="357" width="0.2" height="15.0" fill="rgb(214,160,15)" rx="2" ry="2" />
+<text  x="1186.99" y="367.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/pubsub.(*PublicationImpl).DetermineDiffs (117 samples, 0.09%)</title><rect x="1182.5" y="533" width="1.1" height="15.0" fill="rgb(216,227,37)" rx="2" ry="2" />
+<text  x="1185.54" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="11.1" y="501" width="0.2" height="15.0" fill="rgb(232,4,39)" rx="2" ry="2" />
+<text  x="14.05" y="511.5" ></text>
+</g>
+<g >
+<title>github.com/lf-edge/eve/pkg/pillar/pubsub/socketdriver.(*Publisher).serveConnection (124 samples, 0.09%)</title><rect x="1182.5" y="549" width="1.1" height="15.0" fill="rgb(231,46,38)" rx="2" ry="2" />
+<text  x="1185.53" y="559.5" ></text>
+</g>
+<g >
+<title>runtime.clone (82 samples, 0.06%)</title><rect x="1165.7" y="533" width="0.7" height="15.0" fill="rgb(248,4,9)" rx="2" ry="2" />
+<text  x="1168.68" y="543.5" ></text>
+</g>
+<g >
+<title>encoding/json.structEncoder.encode-fm (18 samples, 0.01%)</title><rect x="1182.5" y="469" width="0.2" height="15.0" fill="rgb(224,31,10)" rx="2" ry="2" />
+<text  x="1185.54" y="479.5" ></text>
+</g>
+<g >
+<title>runtime.scang (16 samples, 0.01%)</title><rect x="10.2" y="453" width="0.2" height="15.0" fill="rgb(216,10,24)" rx="2" ry="2" />
+<text  x="13.22" y="463.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/diff/apply.(*fsApplier).Apply (431 samples, 0.32%)</title><rect x="14.3" y="405" width="3.8" height="15.0" fill="rgb(214,87,19)" rx="2" ry="2" />
+<text  x="17.32" y="415.5" ></text>
+</g>
+<g >
+<title>internal/poll.(*FD).Read (1,306 samples, 0.96%)</title><rect x="1167.7" y="485" width="11.3" height="15.0" fill="rgb(254,113,24)" rx="2" ry="2" />
+<text  x="1170.67" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (33 samples, 0.02%)</title><rect x="24.1" y="389" width="0.3" height="15.0" fill="rgb(245,48,11)" rx="2" ry="2" />
+<text  x="27.15" y="399.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/api/services/content/v1._Content_Write_Handler (27 samples, 0.02%)</title><rect x="14.1" y="485" width="0.2" height="15.0" fill="rgb(225,213,31)" rx="2" ry="2" />
+<text  x="17.07" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (338 samples, 0.25%)</title><rect x="1162.5" y="373" width="3.0" height="15.0" fill="rgb(226,51,25)" rx="2" ry="2" />
+<text  x="1165.51" y="383.5" ></text>
+</g>
+<g >
+<title>github.com/containerd/containerd/diff/apply.apply.func1 (122 samples, 0.09%)</title><rect x="17.0" y="357" width="1.1" height="15.0" fill="rgb(226,216,41)" rx="2" ry="2" />
+<text  x="20.00" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (25 samples, 0.02%)</title><rect x="11.1" y="485" width="0.2" height="15.0" fill="rgb(206,106,1)" rx="2" ry="2" />
+<text  x="14.05" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (27 samples, 0.02%)</title><rect x="1184.0" y="341" width="0.2" height="15.0" fill="rgb(218,73,27)" rx="2" ry="2" />
+<text  x="1186.99" y="351.5" ></text>
+</g>
+<g >
+<title>io.(*LimitedReader).Read (17 samples, 0.01%)</title><rect x="1183.8" y="421" width="0.2" height="15.0" fill="rgb(215,122,25)" rx="2" ry="2" />
+<text  x="1186.84" y="431.5" ></text>
+</g>
+<g >
+<title>[unknown] (34 samples, 0.03%)</title><rect x="1166.1" y="437" width="0.3" height="15.0" fill="rgb(229,225,41)" rx="2" ry="2" />
+<text  x="1169.09" y="447.5" ></text>
+</g>
+<g >
+<title>[unknown] (459 samples, 0.34%)</title><rect x="1161.5" y="405" width="4.0" height="15.0" fill="rgb(252,202,11)" rx="2" ry="2" />
+<text  x="1164.46" y="415.5" ></text>
+</g>
+<g >
+<title>io.(*teeReader).Read (17 samples, 0.01%)</title><rect x="1183.8" y="485" width="0.2" height="15.0" fill="rgb(239,209,7)" rx="2" ry="2" />
+<text  x="1186.84" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (48 samples, 0.04%)</title><rect x="34.2" y="437" width="0.4" height="15.0" fill="rgb(210,194,39)" rx="2" ry="2" />
+<text  x="37.16" y="447.5" ></text>
+</g>
+<g >
+<title>runtime.findrunnable (36 samples, 0.03%)</title><rect x="1188.2" y="469" width="0.3" height="15.0" fill="rgb(246,51,10)" rx="2" ry="2" />
+<text  x="1191.23" y="479.5" ></text>
+</g>
+</g>
+</svg>
